@@ -1,8 +1,10 @@
 [English](README.md) | [简体中文](README_zh.md)
 
-# EROFS SHA-256 补丁
+# EROFS 补丁
 
-`series` 将 `0002-explicit-libgcrypt-sha256.patch` 应用于原始 erofs-utils v1.9.1 归档，其 SHA-256 为 `a9ef5ab67c4b8d2d3e9ed71f39cd008bda653142a720d8a395a36f1110d0c432`。这个独立补丁仅修改 `lib/sha256.h` 和 `lib/sha256.c`，不包含可选的磁盘索引补丁。
+`series` 按顺序将补丁应用于原始 erofs-utils v1.9.1 归档，其 SHA-256 为 `a9ef5ab67c4b8d2d3e9ed71f39cd008bda653142a720d8a395a36f1110d0c432`。`0002-explicit-libgcrypt-sha256.patch` 仅修改 `lib/sha256.h` 和 `lib/sha256.c`。本补丁序列不包含可选的磁盘索引补丁。
+
+`0003-exact-chunk-read.patch` 修复 `lib/blobchunk.c` 的 chunk 输入读取：检查有符号 syscall 结果、重试 EINTR、按正数短读推进，并在计算摘要之前拒绝读取错误或意外 EOF。正常内容、完整 SHA-256 去重和布局保持不变。相邻许可文件保留 `GPL-2.0-or-later OR Apache-2.0`。`make test-erofs` 在私有目录重新链接带 read/fortified-read 故障包装器的静态测试二进制，检查真实的 EINTR、短读、EIO、EOF 及部分读取后失败。成功路径比较镜像字节与解出的文件内容，而非仅检查 fsck 状态。包装器仅用于测试，不进入打包工具；若 native cache 缺少编译对象，测试通过选定构建配方在私有目录重建。
 
 构建明确设置 `EROFS_USE_LIBGCRYPT_SHA256`，并禁用 OpenSSL 和多线程。两个 SHA 入口均在首次使用时初始化 Libgcrypt。单线程工具禁用安全内存，因为镜像 chunk 并非秘密数据。初始化或流式上下文分配失败会在摘要被使用前终止进程。一次性散列使用 `gcry_md_hash_buffer`；流式散列使用 SHA-256 上下文，复制全部 32 字节并关闭上下文。没有回退、链接器包装、摘要截断、布局变更或特定 CPU 的构建选项。
 

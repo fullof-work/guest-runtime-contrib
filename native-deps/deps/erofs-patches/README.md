@@ -1,8 +1,10 @@
 [English](README.md) | [简体中文](README_zh.md)
 
-# EROFS SHA-256 patch
+# EROFS patches
 
-`series` applies `0002-explicit-libgcrypt-sha256.patch` to the original erofs-utils v1.9.1 archive, SHA-256 `a9ef5ab67c4b8d2d3e9ed71f39cd008bda653142a720d8a395a36f1110d0c432`. This standalone patch changes only `lib/sha256.h` and `lib/sha256.c`. It does not include the optional disk index patch.
+`series` applies the ordered patches to the original erofs-utils v1.9.1 archive, SHA-256 `a9ef5ab67c4b8d2d3e9ed71f39cd008bda653142a720d8a395a36f1110d0c432`. `0002-explicit-libgcrypt-sha256.patch` changes only `lib/sha256.h` and `lib/sha256.c`. The series does not include the optional disk index patch.
+
+`0003-exact-chunk-read.patch` fixes chunk input reads in `lib/blobchunk.c`: check signed syscall results, retry EINTR, advance through positive short reads, and reject errors or unexpected EOF before hashing. Successful content, full SHA-256 deduplication and layout stay unchanged. The adjacent license sidecar preserves `GPL-2.0-or-later OR Apache-2.0`. `make test-erofs` relinks a private static test binary with read/fortified-read fault wrappers and checks real EINTR, short reads, EIO, EOF and partial-then-error behavior. It compares successful image bytes and extracted file contents, not just fsck status. The wrappers are test inputs only and never enter packaged tools. If a native cache lacks compilation objects, the test reconstructs them through the selected build recipe in private storage.
 
 The build explicitly defines `EROFS_USE_LIBGCRYPT_SHA256` and disables OpenSSL and multithreading. Both SHA entry points initialize Libgcrypt on first use. The single-threaded tools disable secure memory because image chunks are not secrets. Initialization or streaming-context allocation failure aborts before a digest can be used. One-shot hashing uses `gcry_md_hash_buffer`; streaming uses the SHA-256 context, copies all 32 bytes, and closes it. There is no fallback, linker wrapping, digest truncation, layout change, or CPU-specific build flag.
 
