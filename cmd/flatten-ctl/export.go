@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -63,17 +64,19 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 	// Only upload/re-read needs a complete temporary P; stdout has none.
 	named := output != "" && output != "-"
 	if named {
-		if st, err := os.Stat(output); err == nil && st.IsDir() {
-			return fmt.Errorf("create artifact: destination is a directory")
+		if _, _, err := outputPermissions(output); err != nil {
+			return fmt.Errorf("create artifact: %w", err)
 		}
 	}
 	var pending string
 	if named || upload {
-		dir := tmpDir
+		var f *os.File
+		var err error
 		if named {
-			dir = filepath.Dir(output)
+			f, err = createPendingOutput(output, ".flatten-artifact-")
+		} else {
+			f, err = os.CreateTemp(tmpDir, ".flatten-artifact-*")
 		}
-		f, err := os.CreateTemp(dir, ".flatten-artifact-*")
 		if err != nil {
 			return fmt.Errorf("create artifact: %w", err)
 		}
@@ -151,6 +154,9 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 		return err
 	}
 	if named {
+		if _, _, err := outputPermissions(output); err != nil {
+			return fmt.Errorf("commit artifact: %w", err)
+		}
 		if err := os.Rename(pending, output); err != nil {
 			return fmt.Errorf("commit artifact: %w", err)
 		}
@@ -173,4 +179,46 @@ func (r exportContextReader) Read(b []byte) (int, error) {
 		return 0, err
 	}
 	return r.r.Read(b)
+}
+
+// outputPermissions accepts only ordinary destination files. Atomic replacement
+// must not unlink a device, directory or symlink. Check again at commit time.
+func outputPermissions(output string) (os.FileMode, bool, error) {
+	st, err := os.Lstat(output)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0666, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !st.Mode().IsRegular() {
+		return 0, false, fmt.Errorf("destination is not a regular file: %s", output)
+	}
+	return st.Mode().Perm(), true, nil
+}
+
+func createPendingOutput(output, prefix string) (*os.File, error) {
+	mode, exists, err := outputPermissions(output)
+	if err != nil {
+		return nil, err
+	}
+	for range 10 {
+		name := filepath.Join(filepath.Dir(output), prefix+rand.Text())
+		// A new output keeps normal 0666 & umask semantics. Existing output
+		// permissions are restored explicitly, unaffected by this process's umask.
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			if err = f.Chmod(mode); err != nil {
+				return nil, errors.Join(err, f.Close(), os.Remove(name))
+			}
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("reserve pending output: %w", os.ErrExist)
 }

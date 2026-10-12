@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -231,6 +232,10 @@ func TestExportProcess(t *testing.T) {
 		return
 	}
 	mode, root := os.Args[i+1], os.Args[i+2]
+	if mode == "umask-0077" {
+		syscall.Umask(0077)
+		mode = ""
+	}
 	args := os.Args[i+3:]
 	if strings.HasPrefix(mode, "restore-sigpipe-") {
 		err := runExport(args, exportIO{})
@@ -283,6 +288,15 @@ func TestExportProcess(t *testing.T) {
 				}
 				if err := os.WriteFile(filepath.Join(root, "ingested.img"), b, 0o600); err != nil {
 					return "", err
+				}
+				if mode == "upload-destination-fifo" {
+					output := filepath.Join(root, "result.img")
+					if err := os.Remove(output); err != nil {
+						return "", err
+					}
+					if err := syscall.Mkfifo(output, 0600); err != nil {
+						return "", err
+					}
 				}
 				if mode == "upload-failure" {
 					return "", errors.New("ingest: injected failure")
@@ -523,5 +537,97 @@ func TestPackedImageDeclaresOriginalPayloadBoundary(t *testing.T) {
 	}
 	if !bytes.Equal(all[:len(payload)], payload) {
 		t.Fatal("payload changed")
+	}
+}
+
+func TestExportNamedOutputPermissions(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, mode := range []string{"", "umask-0077"} {
+			t.Run(fmt.Sprintf("existing-%t/%s", existing, mode), func(t *testing.T) {
+				f := newExportFixture(t)
+				var want os.FileMode
+				if existing {
+					if err := os.Chmod(f.output, 0660); err != nil {
+						t.Fatal(err)
+					}
+					want = 0660
+				} else {
+					if err := os.Remove(f.output); err != nil {
+						t.Fatal(err)
+					}
+					control := filepath.Join(f.root, "mode-control")
+					if err := os.WriteFile(control, nil, 0666); err != nil {
+						t.Fatal(err)
+					}
+					st, _ := os.Stat(control)
+					want = st.Mode().Perm()
+					if mode == "umask-0077" {
+						want = 0600
+					}
+				}
+				_, stderr, code := f.run(t, mode, false, "--no-progress", "--tmpdir", f.scratch, "--config", f.config, "--output", f.output, f.source)
+				if code != 0 {
+					t.Fatalf("export %d: %s", code, stderr)
+				}
+				st, err := os.Stat(f.output)
+				if err != nil || st.Mode().Perm() != want {
+					t.Fatalf("mode got %v err %v want %o", st, err, want)
+				}
+				assertExportScratch(t, f.scratch, nil)
+			})
+		}
+	}
+}
+
+func TestExportRejectsSpecialOutputBeforePreparation(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("fifo", link); err != nil {
+		t.Fatal(err)
+	}
+	for _, output := range []string{dir, fifo, link} {
+		before, err := os.Lstat(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = writePreparedExport(context.Background(), output, true, dir, nil, true, func([]string) (*flatten.PreparedImage, error) {
+			t.Fatal("special output reached preparation/upload")
+			return nil, nil
+		}, exportIO{})
+		if err == nil {
+			t.Fatal("accepted special output", output)
+		}
+		after, e := os.Lstat(output)
+		if e != nil || !os.SameFile(before, after) {
+			t.Fatal("special output replaced", e)
+		}
+	}
+	if _, _, err := outputPermissions(os.DevNull); err == nil {
+		t.Fatal("device accepted")
+	}
+}
+
+func TestExportRechecksDestinationBeforeCommit(t *testing.T) {
+	f := newExportFixture(t)
+	output := filepath.Join(f.root, "result.img")
+	writeExportFile(t, output, []byte("previous"))
+	manifestConfig := filepath.Join(f.root, "empty-manifest.yaml")
+	writeExportFile(t, manifestConfig, []byte("{}\n"))
+	_, stderr, code := f.run(t, "upload-destination-fifo", false, "--no-progress", "--tmpdir", f.scratch, "--config", f.config, "--output", output, "--upload", "--manifest-config", manifestConfig, f.source)
+	if code != 1 || !strings.Contains(stderr, "commit artifact: destination is not a regular file") {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	st, err := os.Lstat(output)
+	if err != nil || st.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("replaced late FIFO: %v %v", st, err)
+	}
+	assertExportScratch(t, f.scratch, nil)
+	pending, err := filepath.Glob(filepath.Join(f.root, ".flatten-artifact-*"))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending artifact remains: %v %v", pending, err)
 	}
 }
