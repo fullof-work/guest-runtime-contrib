@@ -16,7 +16,7 @@ export MKFS_EROFS_PATH
 
 log preflight
 [ "$(uname -s)" = Linux ] || die "E2E requires Linux"
-for tool in python3 curl docker timeout readlink stat "$FLATTEN_CTL" "$ZOT_BIN" "$MKFS_EROFS_PATH" "$FSCK_EROFS"; do
+for tool in python3 curl docker timeout readlink stat chroot cmp "$FLATTEN_CTL" "$ZOT_BIN" "$MKFS_EROFS_PATH" "$FSCK_EROFS"; do
     have "$tool" || die "prerequisite not found: $tool"
 done
 require_root
@@ -132,6 +132,41 @@ else
         die "E2E_IMAGE must already be cached: $E2E_IMAGE (no automatic pull)"
     FIXTURE_ARCH="$(fixture_arch "$E2E_IMAGE")"
 fi
+
+log "image.flatten: static tools in an empty root -> non-seekable artifact"
+capture empty-root python3 - "$WORK/empty-root" "$FLATTEN_CTL" "$MKFS_EROFS_PATH" <<'PY'
+import os, pathlib, shutil, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+for name in ["bin", "dev", "source", "scratch"]:
+    (root / name).mkdir(parents=True)
+for source in sys.argv[2:]:
+    shutil.copy2(source, root / "bin" / pathlib.Path(source).name)
+os.mknod(root / "dev/null", 0o20666, os.makedev(1, 3))
+payload = root / "source/payload"
+payload.write_bytes(b"static empty-root streaming artifact\n" * 1024)
+os.chown(payload, 10001, 10002)
+os.chmod(payload, 0o640)
+env = os.environ.copy()
+env["MKFS_EROFS_PATH"] = "/bin/mkfs.erofs"
+command = ["chroot", str(root), "/bin/flatten-ctl", "export", "--tmpdir", "/scratch",
+           "--output", "-", "--no-progress", "/source"]
+with (root / "artifact").open("wb") as output, subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as child:
+    shutil.copyfileobj(child.stdout, output)
+    child.stdout.close()
+    if child.wait() != 0:
+        raise SystemExit("empty-root export failed")
+assert not list((root / "scratch").iterdir()), "export scratch survived"
+assert not any((root / name).exists() for name in ["lib", "lib64", "etc"])
+PY
+capture empty-info "$FLATTEN_CTL" info --json "$WORK/empty-root/artifact"
+capture empty-payload "$FLATTEN_CTL" tar extract -f "$WORK/empty-root/artifact" --dense --no-chown \
+    "image:$WORK/empty-root/payload.erofs"
+mkdir "$WORK/empty-root/extracted"
+capture empty-fsck "$FSCK_EROFS" --extract="$WORK/empty-root/extracted" "$WORK/empty-root/payload.erofs"
+cmp "$WORK/empty-root/source/payload" "$WORK/empty-root/extracted/payload" || die "empty-root payload content changed"
+[ "$(stat -c '%u:%g:%a' "$WORK/empty-root/extracted/payload")" = "10001:10002:640" ] \
+    || die "empty-root payload ownership/mode changed"
+ok "static empty-root export, actual pipe, consumer content/metadata and scratch cleanup"
 
 log "image.flatten: real registry image -> EROFS"
 start_zot "$WORK/zot" ZOT_PORT
