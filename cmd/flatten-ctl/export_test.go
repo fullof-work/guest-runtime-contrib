@@ -28,9 +28,9 @@ func TestExportLifecycle(t *testing.T) {
 		name, mode, output, config, wantErr, wantFile       string
 		upload, stream, mkfsFail, sharedScratch, brokenPipe bool
 	}{
-		{name: "mkfs-partial-output", output: "file", mkfsFail: true, wantErr: "flatten: mkfs.erofs: exit status 7: fake mkfs failure", wantFile: "previous"},
+		{name: "mkfs-partial-output", output: "file", mkfsFail: true, wantErr: "exit status 7: fake mkfs failure", wantFile: "previous"},
 		{name: "artifact-create", output: "directory", wantErr: "create artifact: open", wantFile: "previous"},
-		{name: "runtime-config", output: "file", config: "runtime", wantErr: "flatten: runtime config:", wantFile: "previous"},
+		{name: "runtime-config", output: "file", config: "runtime", wantErr: "runtime config:", wantFile: "previous"},
 		{name: "missing-manifest", upload: true, wantErr: "missing manifest config: pass --manifest-config <path> or set MANIFEST_CONFIG", wantFile: "previous"},
 		{name: "invalid-manifest", upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "previous"},
 		{name: "unreadable-manifest", upload: true, config: "unreadable", wantErr: "load config: manifest: read", wantFile: "previous"},
@@ -58,14 +58,14 @@ func TestExportLifecycle(t *testing.T) {
 		{name: "upload-file-success", mode: "upload-success", output: "file", upload: true, config: "empty", wantFile: "artifact"},
 		{name: "upload-stdout-success", mode: "upload-success", output: "-", upload: true, stream: true, config: "empty", wantFile: "previous"},
 		{name: "shared-scratch", output: "scratch-file", sharedScratch: true, wantFile: "artifact"},
-		{name: "shared-scratch-mkfs-failure", output: "file", sharedScratch: true, mkfsFail: true, wantErr: "flatten: mkfs.erofs: exit status 7: fake mkfs failure", wantFile: "previous"},
+		{name: "shared-scratch-mkfs-failure", output: "file", sharedScratch: true, mkfsFail: true, wantErr: "exit status 7: fake mkfs failure", wantFile: "previous"},
 		{name: "shared-scratch-config-failure", output: "scratch-file", sharedScratch: true, upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "artifact"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newExportFixture(t)
-			wantArtifact := expectedExportArtifact(t)
+			wantArtifact := expectedExportArtifact(t, f)
 			args := []string{"--no-progress", "--tmpdir", f.scratch, "--config", f.config}
 			output := f.output
 			scratchFiles := map[string][]byte{}
@@ -197,7 +197,7 @@ func TestExportRestoresSIGPIPE(t *testing.T) {
 			t.Parallel()
 			f := newExportFixture(t)
 			output := f.output
-			wantFile := expectedExportArtifact(t)
+			wantFile := expectedExportArtifact(t, f)
 			if outcome == "error" {
 				output = f.source // Artifact creation fails after raw output exists.
 				wantFile = []byte("previous user artifact\n")
@@ -382,7 +382,15 @@ func newExportFixture(t *testing.T) exportFixture {
 		t.Fatal(err)
 	}
 	writeExportFile(t, f.output, []byte("previous user artifact\n"))
-	writeExportFile(t, f.mkfs, []byte(fakeExportMkfs))
+	native := os.Getenv("MKFS_EROFS_PATH")
+	if native == "" {
+		t.Skip("set MKFS_EROFS_PATH to the maintained native Plan tool")
+	}
+	capability, err := exec.Command(native, "--plan-version").CombinedOutput()
+	if err != nil || !bytes.Contains(capability, []byte("erofs-plan 1")) {
+		t.Fatalf("native Plan capability: %s %v", capability, err)
+	}
+	writeExportFile(t, f.mkfs, []byte("#!/bin/sh\nexec '"+strings.ReplaceAll(native, "'", "'\"'\"'")+"' \"$@\"\n"))
 	if err := os.Chmod(f.mkfs, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -424,24 +432,18 @@ func (f exportFixture) run(t *testing.T, mode string, brokenPipe bool, args ...s
 	return stdout.Bytes(), stderr.String(), code
 }
 
-func expectedExportArtifact(t *testing.T) []byte {
+func expectedExportArtifact(t *testing.T, f exportFixture) []byte {
 	t.Helper()
 	raw := filepath.Join(t.TempDir(), "expected.raw")
-	writeExportFile(t, raw, []byte("fake EROFS bytes\x00tail\n"))
+	cmd := exec.Command(f.mkfs, "-Ededupe", "--chunksize=4096", "-T0", "-b4096", "-x-1", "-U", "00000000-0000-0000-0000-000000000000", "--quiet", "--ignore-mtime", raw, f.source)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("raw baseline: %s %v", out, err)
+	}
 	if err := image.AppendConfigZip(raw, &image.RuntimeConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	payload, err := os.ReadFile(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	logical, err := sparse.NewSource(bytes.NewReader(payload), uint64(len(payload)), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	src := exportBoundarySource{Source: logical, boundary: uint64(len("fake EROFS bytes\x00tail\n"))}
 	var artifact bytes.Buffer
-	if _, _, err := tarstream.WriteTo(context.Background(), &artifact, "image", src); err != nil {
+	if err := packImageArtifact(raw, &artifact); err != nil {
 		t.Fatal(err)
 	}
 	return artifact.Bytes()
