@@ -52,13 +52,15 @@ const flattenSkeleton = `# flatten config — flatten-ctl export --config <this>
 tmpdir: ""                 # parent of per-run scratch dirs ("" -> $TMPDIR or /tmp)
 platform: ""               # os/arch[/variant] to pull ("" -> host linux/<arch>); --platform overrides
 insecure: false            # allow plain-HTTP registries (dev/private); does NOT affect TLS cert verification
-pull_jobs: 4               # concurrent layer downloads
+pull_jobs: 4               # legacy remote.Pull complete-download concurrency
 tls:                       # HTTPS cert verification (registry + CDN blob redirects)
   ca_cert: ""              # path to extra CA bundle (PEM) to trust, e.g. an intercepting proxy's root CA
   insecure_skip_verify: false # disable cert verification entirely (insecure; prefer ca_cert)
 cache:
-  dir: ""                  # persistent blob cache dir ("" -> ephemeral, removed after the run)
+  dir: ""                  # persistent blob cache dir ("" -> direct streaming, no layer cache)
   max_size: "10GiB"        # cache cap ("" -> default, "0" -> unlimited)
+  in_flight_bytes: "256MiB" # budget for pending compressed layers; current layer has priority
+  required: false          # fail if a layer exceeds the cache budget instead of streaming past it
 referer:
   validity: ""             # optional Go duration for referer put expiry; --validity overrides
 `

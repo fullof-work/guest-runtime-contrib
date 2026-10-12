@@ -20,7 +20,7 @@ Container images contain several tar layers. A container runtime normally merges
 
 Choose one of three inputs:
 
-- **Remote registry image:** a reference such as `nginx:1.27` or `gcr.io/ns/app@sha256:...`. `flatten-ctl` pulls and flattens it directly (§2.3). `FLATTEN_REGISTRY_*` environment variables supply credentials, and layer blobs use a local OCI-layout cache that can be shared across processes.
+- **Remote registry image:** a reference such as `nginx:1.27` or `gcr.io/ns/app@sha256:...`. `flatten-ctl` pulls and flattens it directly (§2.3). `FLATTEN_REGISTRY_*` environment variables supply credentials, and an explicit OCI-layout cache can be shared across processes. Without `cache.dir`, layers stream directly.
 - **Docker archive:** a tar stream produced by `docker save`, supplied on stdin or from a local file.
 - **Already-flattened rootfs directory:** if the positional argument is a local directory, mkfs.erofs reads it in place without a staging-tree copy or source mutation (§2.1). This still reads source data and writes the output.
 
@@ -75,7 +75,7 @@ Registry/archive export preserves ownership and permissions (§4.3), so it requi
 
 Progress and diagnostics go to stderr. Stdout carries requested results: the artifact stream, manifest key, or resolved digest with `--print-digest`. Keep these output modes separate in scripts: the current CLI can append a manifest key after an artifact for `--upload --output -`, and `--upload --print-digest` produces multiple stdout values. Use a named `--output` or upload without artifact stdout when capturing a key.
 
-`export` / `cache gc` accept `--no-progress`. Pull progress reports `pull: <done>/<total> layers` for cache misses only; flattening reports `flatten: ...`; upload reports `upload: ...` with percentage and rate. Byte-progress updates are throttled to two seconds.
+`export` / `cache gc` accept `--no-progress`. Streaming export reports preparation stages as `flatten: ...`; upload reports `upload: ...` with percentage and rate. The complete-download `remote.Pull` API retains its separate layer-count progress callback. Byte-progress updates are throttled to two seconds.
 
 ### 2.1 `flatten-ctl export`
 
@@ -141,7 +141,7 @@ flatten-ctl referer put --owner "$OWNER" --manifest-id "$APP_KEY" --config flatt
 flatten-ctl export --output big.img --config flatten.yaml ./big.tar
 ```
 
-**Rootfs-directory source:** mkfs.erofs reads the directory in place, without staging or changing source metadata. Timestamp normalization uses `-T0 --ignore-mtime` inside the image builder. Ownership preservation needs read access rather than chown capability; run as root to read a complete rootfs. `--skip` and `--skip-mounts` remove the **entire node**, including the excluded directory itself. The raw mkfs output is automatically excluded when it lies under the rootfs; for a final artifact inside a live rootfs, place scratch and output on an excluded mountpoint so a previous artifact cannot be included on a later export. Exporting `/` requires `--skip-mounts` to avoid traversing /proc and /sys. Directory input rejects `--platform`, `--print-digest`, `--registry` and `--archive`.
+**Rootfs-directory source:** mkfs.erofs reads the directory in place, without staging or changing source metadata. Timestamp normalization uses `-T0 --ignore-mtime` inside the image builder. Ownership preservation needs read access rather than chown capability; run as root to read a complete rootfs. `--skip` and `--skip-mounts` remove the **entire node**, including the excluded directory itself. The caller must stop all writers before export. One fixed selection excludes owned scratch, plan files, pending output, the destination and their discovered aliases; planning, reading and final validation use that same selection. An excluded mountpoint is useful for scratch and output when exporting a guest root. Exporting `/` requires `--skip-mounts` to avoid traversing /proc and /sys. Directory input rejects `--platform`, `--print-digest`, `--registry` and `--archive`.
 
 ```bash
 # Export a machine/guest root; first create excluded scratch/output (mount privilege required)
@@ -159,41 +159,39 @@ flatten-ctl export --skip-mounts --upload --manifest-config m.yaml /srv/rootfs
 
 #### Temporary files and failure handling
 
-Export puts its raw EROFS payload in `flatten-erofs-*.img` under the scratch parent
-selected by `--tmpdir`, configuration `tmpdir`, or the system temporary directory
-(`TMPDIR`, normally `/tmp`). It releases this file immediately after packing
-succeeds and the raw source and artifact writer close, before copying a packed
-artifact to stdout or starting upload.
+The default Registry export retains one private rootfs and bounded Plan metadata.
+It streams the existing artifact to any writer, including non-seekable stdout,
+without storing the whole compressed image, a mkfs data blob, or a raw image.
+Scratch uses `--tmpdir`, configuration `tmpdir`, then `$TMPDIR` or `/tmp`.
 
 | Resource | Lifetime and failure behavior |
 |---|---|
-| Internal raw `flatten-erofs-*.img` | Removed after packing, or when export returns an error, including a mkfs failure after partial output. |
-| Internal artifact `flatten-image-*.img` | Used by `--upload` without `--output`, or by `--upload --output -`. Removed when export returns, on success or error, including invalid manifest configuration and ingest failures. |
-| Named `--output` | Kept on success and failure, including upload failure. Writing directly to this path still creates or truncates it; a packing/write/close failure may leave a partial artifact. Cleanup does not delete or restore it. |
-| Input archive, source rootfs, persistent cache, unrelated files and scratch parent | Never removed by export's temporary-file cleanup. The normal persistent-cache eviction policy still applies (§2.4). |
+| Private rootfs and Plan/layout | Owned by `PreparedImage` until output ends. Close waits for active work and releases its files and FDs. A failed layer invalidates the entire private rootfs; a retry starts fresh from the pinned input. |
+| Docker-save input | A seekable file is indexed in place. Non-seekable input retains one bounded outer-archive spool, removed after all layers verify, before planning. Inner layer tars are not extracted separately. |
+| Final artifact P | Stdout-only export streams directly. Upload/re-read retains one necessary P; it is removed after completion or error. |
+| Named `--output` | Written to a sibling pending file. Writer close, source validation, prepared-resource cleanup and requested upload must succeed before atomic rename. Failure preserves an existing destination. |
+| Explicit persistent cache | Verified completed blobs survive export cleanup. Pending writes belong to their writer; cancellation joins prefetch before removing its pending files. GC is a separate bounded-cache operation (§2.4). |
+| Caller directory, input archive, unrelated files and scratch parent | Never removed by owned-resource cleanup. |
 
-Operational errors reach the outer CLI only after owned resources unwind; the CLI
-then prints `error: ...` to stderr and exits with status 1. When a downstream reader
-closes stdout, export cleans up its temporary files, reports the broken pipe on
-stderr and exits with status 1. Artifact bytes and the existing stdout modes are
-unchanged, including the appended key with
-`--upload --output -`. Abrupt termination such as `SIGKILL` does not run Go defers
-and can leave scratch files; this is cleanup for ordinary success and failure,
-not a crash-recovery or stale-file sweeping service.
+Cancellation closes owned input bodies, waits for layer application and native
+processes to stop, and only then removes scratch. Broken stdout pipes unwind the
+same resources and return an error. SIGKILL cannot run cleanup; export does not
+provide a global stale-file sweeper. `--upload --output -` keeps its existing
+stdout convention of artifact bytes followed by the manifest key.
 
-The maintained lifecycle regressions can be run without root, a registry/store,
-network access or a real mkfs executable (Go dependencies must already be cached):
+The maintained lifecycle regressions use the real maintained native tool, plus
+per-invocation write/close/upload fault substitutes:
 
 ```bash
-GOFLAGS=-p=2 GOMAXPROCS=2 go test ./cmd/flatten-ctl
+make -C native-deps erofs
+MKFS_EROFS_PATH="$PWD/native-deps/bin/$(uname -m)/mkfs.erofs" \
+    GOFLAGS=-p=2 GOMAXPROCS=2 go test -race ./cmd/flatten-ctl
 ```
 
-They use a small local fake mkfs and per-invocation write/close/upload substitutes
-to check failure cleanup, raw-file release before ingest, preserved user files,
-CLI exit behavior (including reader-closed stdout pipes and restoration of SIGPIPE
-behavior) and exact artifact bytes for the fixture. They do not validate
-real EROFS construction or live registry/store integration; those remain covered
-by the [E2E procedures](../test/e2e/README.md).
+They check atomic output, cleanup before ingest, preserved user files, broken
+pipes and artifact identity against the ordinary native layout. Tests requiring
+the native tool skip if it is absent. Real Guest and live-store acceptance uses
+the [E2E procedures](../test/e2e/README.md).
 
 ### 2.2 `flatten-ctl info` — inspect an image
 
@@ -269,13 +267,15 @@ For a registry input (§2), `flatten-ctl` uses [go-containerregistry] to pull an
 tmpdir: ""                     # Per-run scratch parent; empty = $TMPDIR or /tmp
 platform: linux/amd64          # Empty = linux/$GOARCH; --platform overrides
 insecure: false                # Allow plain HTTP; does not disable TLS verification
-pull_jobs: 4                   # Parallel layer downloads, serial layer application
+pull_jobs: 4                   # Legacy remote.Pull download concurrency
 tls:                           # HTTPS verification for registry and CDN redirects
   ca_cert: ""                  # Extra trusted PEM CA bundle; may contain several certs
   insecure_skip_verify: false  # Disable certificate verification; prefer ca_cert
 cache:
-  dir: ""                      # Persistent OCI layout; empty = temporary, cleaned on exit
+  dir: ""                      # Persistent OCI layout; empty = direct streaming
   max_size: 10GiB              # LRU limit; "0" = unlimited, except explicit cache gc
+  in_flight_bytes: 256MiB      # Pending compressed bytes; current layer first
+  required: false             # Oversize layers bypass; true rejects instead
 referer:
   validity: 720h               # Optional expiry interval written by referer put
 ```
@@ -286,7 +286,16 @@ The artifact type is fixed at `application/vnd.kuasar.flatten-manifest.v1` and c
 
 **TLS (`tls.*`):** applies to all HTTPS requests, including registry APIs and CDN blob redirects. An intercepting proxy may re-sign either with a private CA that the system trust store does not accept. `ca_cert` appends a PEM CA bundle to the system roots. `insecure_skip_verify` disables certificate verification entirely and is an explicit fallback when the CA cannot be supplied. It is independent of `insecure`, which only permits a plain-HTTP registry and does not change HTTPS verification.
 
-**Local cache:** a standard **OCI image layout** with `oci-layout`, `index.json` and `blobs/<algo>/<hex>`, inspectable with tools such as crane or skopeo. Blob presence by digest determines a cache hit. Downloads verify the digest while streaming and install blobs atomically using temporary-file rename. Multiple processes can share the content-addressed directory. When occupancy exceeds `max_size`, reclamation takes flock and uses LRU (mtime) to reach a low watermark; a grace period protects recently written blobs against concurrent deletion. A shared `cache.dir` enables cross-task reuse; a per-task directory isolates tasks.
+**Local cache:** a standard OCI layout with `oci-layout`, `index.json` and
+`blobs/<algo>/<hex>`. Export stages a candidate only with explicit `cache.dir`.
+The current layer gets budget first; at most the next layer is prefetched when
+its complete descriptor fits the remaining byte budget. An oversize layer streams
+directly, or fails if `cache.required` is true. EOF alone never publishes a hit:
+compressed size/digest, complete decoded DiffID/trailer and Close must all pass.
+Hits are reverified during application. Duplicate writers keep the committed
+inode. Reader/writer leases prevent GC from unlinking active data; abandoned
+pending files become GC-eligible after the grace period. Completed persistent
+blobs outlive the export. Cache `max_size` is an LRU target, not a filesystem quota.
 
 **Multiple architectures:** a registry reference can resolve to a manifest index. `platform` selects its concrete image before flattening. `Architecture` and `Os` are copied into config.json (§3.2); flattening itself does not validate that the resulting application can execute on the selected sandbox.
 
@@ -304,12 +313,19 @@ flatten-ctl referer put --owner <owner-token> --manifest-id <64hex> [--validity 
 `lookup` resolves the source to the platform image digest `D` and probes the OCI 1.1 Referrers API. Output:
 
 ```json
-{"supported":true,"subject":"repo/app@sha256:...","hit":true,"manifest_id":"..."}
+{"conversion_semantics":"umoci-erofs-no-xattr-v1","supported":true,"subject":"repo/app@sha256:...","hit":true,"manifest_id":"..."}
 ```
 
 - `supported=false`: the registry does not support Referrers; the caller chooses fallback or failure.
 - `supported=true, hit=false`: the API exists, but there is no correctly formatted, unexpired record matching the owner. The caller continues export and host-side upload.
 - `supported=true, hit=true`: the host can validate and reuse `manifest_id`, avoiding pull/flatten.
+
+Lookup and writeback both use the actual generator's conversion policy. Missing
+or mismatched `conversion` annotations are misses; original layer caches and
+explicit old artifact references remain usable. Builder integration passes
+`--conversion-semantics` to lookup/export/put, so an old or incompatible Guest tool
+fails rather than labeling an old conversion as current. This policy does not
+enter the artifact content identity and is independent of the internal Plan schema.
 
 `lookup` strictly validates `valid_at`. Missing/malformed timestamps, future import times, expired records and expiry before import are skipped as misses. If several records are valid, the newest import wins.
 
@@ -320,6 +336,7 @@ Referrer annotations:
 ```text
 vnd.kuasar.flatten-manifest.owner    = <hmac-hex> <referer_desc>
 vnd.kuasar.flatten-manifest.id       = <manifest_id>                        # Ingest content key
+vnd.kuasar.flatten-manifest.conversion = umoci-erofs-no-xattr-v1
 vnd.kuasar.flatten-manifest.valid_at = <import RFC3339>[ <expiry RFC3339>]
 ```
 
@@ -336,7 +353,7 @@ flatten-ctl cache info [--config <p>] [--cache-dir <D>]
 flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [--no-progress]
 ```
 
-`cache` manages a **persistent** cache with explicit `cache.dir`. The default temporary cache is removed after export and needs no separate GC. `cache info` reports directory, blob count, occupancy and limit. `cache gc` takes flock and reclaims by LRU to the configured or overridden `--cache-max-size` limit; explicit GC with `"0"` empties it except for entries in the grace period. `--cache-dir` overrides the configuration's directory. A long-running installation can schedule GC periodically; export also performs reclamation after pulling. The grace period and concurrent writes mean this is a reclamation policy, not an instantaneous filesystem quota.
+`cache` manages a **persistent** cache with explicit `cache.dir`. Default streaming export creates no whole-image compressed-layer cache and needs no separate GC. `cache info` reports directory, blob count, occupancy and limit. `cache gc` takes flock and reclaims by LRU to the configured or overridden `--cache-max-size` limit; explicit GC with `"0"` empties it except for entries in the grace period. `--cache-dir` overrides the configuration's directory. A long-running installation can schedule GC periodically; export also performs reclamation after preparation. The grace period and concurrent writes mean this is a reclamation policy, not an instantaneous filesystem quota.
 
 ### 2.5 `flatten-ctl tar` — tar extraction and single-file sparse streams
 
@@ -467,66 +484,101 @@ Before starting the application, `sandbox-ctl run` reads the trailing ZIP throug
 
 ## 4. Algorithm
 
-### 4.1 Layer iteration
+### 4.1 Input and layer lifetime
 
-The flattening engine's `Source` supplies bottom-to-top layers, each as an **uncompressed tar stream**, plus raw OCI image-config JSON. Two implementations share the deterministic `Build` sink:
+`remote.Stream` pins the platform manifest, config, descriptors and matching
+DiffIDs before opening layers. Each `LayerInput.Open` returns a fresh body for
+that immutable identity. Preparation owns it, closes it exactly once, and checks
+Close errors. Gzip, zstd and plain decoding follow the admitted media type.
+Tar EOF is not stream EOF: bounded tail reads verify the entire decoded DiffID,
+compressed size/digest and decoder trailer. Errors or cancellation stop input;
+they do not drain an unbounded failed body. No artifact is emitted until every
+layer passes. `remote.Pull` retains its complete-download, reopenable Source
+contract; legacy `Build(Source, ...)` still accepts uncompressed reopenable layers.
 
-- **Docker archive:** its outer tar contains manifest.json, which gives layer order and config path, plus the layer tarballs. Extract into a temporary directory, then open layers in manifest order; gzip layers are transparently decoded.
-- **Registry:** [accelerator/pkg/remote](https://github.com/kuasar-sandbox/accelerator/tree/main/pkg/remote) reads blobs through the OCI-layout cache and decodes gzip/zstd according to media type into the same uncompressed layer stream (§2.3).
+`PrepareArchive` bounds its outer index, validates members, offsets, lengths and
+archive termination, and opens layers in manifest order. A seekable archive stays
+in place; a pipe is spooled once. `PrepareImage`, `PrepareArchive` and `PrepareDir`
+all produce a `PreparedImage` owning its selected source, layout, plan and FDs.
+Legacy `Flatten` borrows its reader; `PrepareArchive` owns and closes its body.
+Selected config and layers must be regular members. The existing Skopeo legacy
+alias `<hex>/layer.tar -> ../<diff-id>.tar` is accepted only when its target is a
+selected regular layer; it is indexed but never followed or extracted. Other
+outer links and sparse members are rejected.
 
-`Build` applies each layer's entries to a temporary staging rootfs. Upper entries replace lower entries at the same path. Tar ownership and mode, including setuid/setgid/sticky, are restored using chown followed by chmod, because chown can clear setuid/setgid. This requires root/CAP_CHOWN (§2). The image configuration is projected (§3.2) and appended as ZIP after filesystem generation. Directory sources use the separate in-place `BuildFromDir` path (§2.1).
+### 4.2 OCI application and stable source
 
-### 4.2 Whiteouts
+The Linux adapter uses **umoci v0.6.0** layer APIs without its CLI, CAS or runtime
+bundle generation. It preserves numeric UID/GID, mode, ordinary directory and
+type-replacement semantics, implicit parents, hardlink identity and special files.
+Late `.wh.<name>` and `.wh..wh..opq` markers affect lower-layer entries without
+deleting same-layer additions. Permission failures fail preparation. Supported
+layer xattrs are applied and checked in the private rootfs; see the output policy
+in §4.3. A half-applied tree is discarded, never repaired by replaying a layer in place.
 
-OCI layers express deletion with special names:
+Private rootfs writes end after layer application. An existing directory must
+remain stable for the complete prepare/output lifetime; selection and digest
+checks detect changes but cannot create an atomic snapshot of a concurrent tree.
+One selection, including `Skip`, `SkipMounts` and all owned scratch/spool/layout/
+output exclusions, is shared by planning, reading and final validation. Reading
+atime or modifying excluded contents does not invalidate the selected tree.
+Changes to included metadata, links, objects or directory membership do.
 
-- `.wh.<name>` deletes `<name>` in the same directory, whether file or directory.
-- `.wh..wh..opq` makes its directory opaque, hiding lower-layer entries beneath it.
+### 4.3 Layout and metadata policy
 
-The merge engine recognizes these markers, removes the corresponding staged entries, and omits the markers themselves. The final EROFS contains the merged visible filesystem.
-
-### 4.3 Metadata normalization
-
-These rules keep output reproducible:
+The maintained **erofs-utils v1.9.1** patch reuses native traversal, sorting,
+inode/NID assignment, hardlinks, superblock, block allocation and chunk indexes.
+It batches source reads at about 1 MiB but still deduplicates each 4 KiB chunk
+with complete SHA-256. Normal raw and Plan output use this same layout algorithm.
 
 | Field | Handling |
 |---|---|
-| mtime / atime | Normalize staged timestamps to epoch zero; `-T0` fixes EROFS timestamps. Directory export uses `--ignore-mtime` without touching the source. |
-| uid / gid / mode | Preserve source values: `/tmp` may need 1777 and a user's home must retain its owner. Layer sources use tar-header chown/chmod and require root/CAP_CHOWN; directory sources read existing metadata. |
-| Inode numbers | Assigned by mkfs.erofs in its deterministic traversal. |
-| Traversal order | mkfs.erofs uses deterministic lexical ordering. |
-| Hardlinks | Reconstruct real staging hardlinks sharing an inode; `-Ededupe` additionally deduplicates data blocks. |
-| Extended attributes | Not written: `-x-1` disables them, and layer tar xattrs are not applied. This also means file capabilities or security labels stored in xattrs are not preserved by this path. |
+| Timestamps and UUID | `-T0 --ignore-mtime` and an all-zero UUID fix output identity without changing a directory source. |
+| UID/GID/mode | Preserve numeric source ownership and permission bits. Insufficient permissions fail layer application. |
+| Inodes/order/hardlinks | Deterministic native traversal and real shared-inode hardlinks; content dedup remains separate. |
+| Extended attributes | Final EROFS uses `-x-1`: **no xattrs, file capabilities or security labels are emitted**, even when applied successfully to the private rootfs. |
+| Compression/devices | Uncompressed, single-device, 4 KiB chunks; no hidden raw/data-blob fallback. |
 
-The generated EROFS features depend on mkfs.erofs. The native build pins erofs-utils **v1.9.1** and its source digest. To compare builds across nodes, use the same pinned executable and settings; the `MKFS_EROFS_PATH`/PATH override mechanism can otherwise select a different version.
+Plan schema and capabilities are internal and versioned independently of
+`image.ConversionSemantics` and artifact identity. The Plan declares logical
+length, source identity/path, ordered target/source offsets, lengths, SHA-256 and
+padding. The reader rejects unsupported features, overflow, excessive counts or
+bytes, missing/truncated inputs, overlaps and out-of-bounds references. Native
+address-space limits cover dedup and inode/path tables; Go budgets cover source
+indexes, decoder/applier bookkeeping and tarstream extent/sparse-map metadata.
+Defaults are finite and configurable through the library limit structures.
 
-### 4.4 mkfs.erofs invocation
+### 4.4 Sequential output and acceptance
 
-`Build` runs mkfs.erofs over the staging rootfs with this fixed base argument set:
+The native process finishes and releases its indexes before emission. Layout
+holes occupied by planned payload are reported as **Data**. `RunAt` is a repeatable
+metadata query and does not consume a data cursor or infer holes by scanning zeros.
+Each payload block is checked against its planned digest before entering a writer.
+The existing runtime-config projection, tailzip and encryption writer are retained.
 
-```text
-mkfs.erofs -Ededupe --chunksize=4096 -T0 -b4096 -x-1 \
-    -U 00000000-0000-0000-0000-000000000000 --quiet <output> <staging-dir>
-```
+An optional tarstream final-validation hook runs after payload completion and
+before the carrier digest marker, complete tail or encryption final record,
+including empty and all-Hole/Zero sources. Prepared output uses it to revalidate
+source selection and Plan/layout identity. A receiver must require the complete
+artifact identity/tail and successful producer/ingester completion before Ready
+or conversion writeback. Observing payload bytes alone is insufficient.
 
-- `-Ededupe --chunksize=4096` deduplicates blocks within the image and uses chunk-based layout, supporting stable offsets and downstream content-defined deduplication.
-- No compression: downstream CDC sees the original data bytes for cross-image deduplication.
-- `-T0`, the fixed UUID and `-x-1` remove timestamp, UUID and xattr variation.
+`WriteRaw` is an explicit API using the same plan. The normal CLI never generates
+raw staging. Named raw and artifact outputs use pending files and atomic commit.
+`Close` cancels active work, joins it and releases owned resources; an arbitrary
+caller-supplied output writer must itself return from a blocked Write.
 
-Directory export adds `--ignore-mtime` and the selected `--exclude-path` arguments. The builder sets mkfs `TMPDIR` to the raw output's directory, keeping dedup scratch with the configured flatten scratch location.
-
-After filesystem generation, the builder opens the payload for append and adds one STORED `config.json` ZIP entry with the constraints in §3.3. The CLI then wraps the complete payload in tarstream (§3.1).
-
-Build mkfs.erofs from the guest-runtime root with `make -C native-deps erofs`. `make flatten-ctl` builds only the CLI; **`make build` builds flatten-ctl and sandbox-runtime.bundle** and can build or stage the runtime's native inputs. Runtime lookup order for mkfs.erofs is `MKFS_EROFS_PATH`, the flatten-ctl executable's directory, then PATH.
-
-The filesystem format supports creation on a different host architecture. That does not translate application executables or remove the guest kernel's EROFS feature requirements.
+Build the maintained native tools with `make -C native-deps erofs`; `make build`
+builds the CLI and runtime bundle through the existing packaging path. Native
+lookup still uses `MKFS_EROFS_PATH`, the CLI directory, then PATH. Missing Plan
+capability fails explicitly. There is no implicit high-space fallback.
 
 ## 5. Design decisions
 
 ### 5.1 Why EROFS rather than ext4 or squashfs
 
 - **Read-only, immutable base:** EROFS matches content-addressed chunks and reusable backing data.
-- **Single payload:** it fits a single image artifact, manifest upload and block-device access; the CLI stages raw output before wrapping or streaming it.
+- **Single payload:** it fits a single image artifact, manifest upload and block-device access; the CLI emits it sequentially from the stable source and Plan.
 - **Portable on-disk format:** the filesystem can be constructed across host architectures, while applications still need the correct execution architecture.
 - **Squashfs comparison:** the platform selects uncompressed, chunk-oriented EROFS for its data and deduplication path. Squashfs can also share immutable backing data; there is no evidence here for a universal density disadvantage.
 - **Ext4 comparison:** ext4 supplies the writable upper layer in this platform. A mutable filesystem requires an isolation/COW strategy when used across sandboxes and has its own maintenance considerations, such as fsck. This is the reason for the current EROFS-base/ext4-upper split, not a universal benchmark proving one format denser than every alternative.

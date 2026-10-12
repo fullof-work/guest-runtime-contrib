@@ -28,27 +28,27 @@ func TestExportLifecycle(t *testing.T) {
 		name, mode, output, config, wantErr, wantFile       string
 		upload, stream, mkfsFail, sharedScratch, brokenPipe bool
 	}{
-		{name: "mkfs-partial-output", output: "file", mkfsFail: true, wantErr: "exit status 7: fake mkfs failure", wantFile: "previous"},
-		{name: "artifact-create", output: "directory", wantErr: "create artifact: open", wantFile: "previous"},
-		{name: "runtime-config", output: "file", config: "runtime", wantErr: "runtime config:", wantFile: "previous"},
+		{name: "mkfs-partial-output", output: "file", mkfsFail: true, wantErr: "flatten: native plan: exit status 7: fake mkfs failure", wantFile: "previous"},
+		{name: "artifact-create", output: "directory", wantErr: "create artifact:", wantFile: "previous"},
+		{name: "runtime-config", output: "file", config: "runtime", wantErr: "invalid character", wantFile: "previous"},
 		{name: "missing-manifest", upload: true, wantErr: "missing manifest config: pass --manifest-config <path> or set MANIFEST_CONFIG", wantFile: "previous"},
 		{name: "invalid-manifest", upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "previous"},
 		{name: "unreadable-manifest", upload: true, config: "unreadable", wantErr: "load config: manifest: read", wantFile: "previous"},
-		{name: "invalid-manifest-named-output", output: "file", upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "artifact"},
+		{name: "invalid-manifest-named-output", output: "file", upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "previous"},
 		{name: "invalid-ingester", upload: true, config: "empty", wantErr: "ingester: manifest: store.endpoint required for ingest", wantFile: "previous"},
 		{name: "ingest-key-failure", upload: true, config: "no-key", wantErr: "ingest: customer key: manifest: customer key required", wantFile: "previous"},
 		{name: "ingest-failure", mode: "upload-failure", upload: true, config: "empty", wantErr: "ingest: injected failure", wantFile: "previous"},
-		{name: "ingest-failure-named-output", mode: "upload-failure", output: "file", upload: true, config: "empty", wantErr: "ingest: injected failure", wantFile: "artifact"},
+		{name: "ingest-failure-named-output", mode: "upload-failure", output: "file", upload: true, config: "empty", wantErr: "ingest: injected failure", wantFile: "previous"},
 		{name: "ingest-failure-stdout", mode: "upload-failure", output: "-", upload: true, stream: true, config: "empty", wantErr: "ingest: injected failure", wantFile: "previous"},
-		{name: "write-file", mode: "write-failure", output: "file", wantErr: "pack image artifact: injected write failure", wantFile: "partial"},
-		{name: "write-temp", mode: "write-failure", upload: true, wantErr: "pack image artifact: injected write failure", wantFile: "previous"},
-		{name: "close-file", mode: "close-failure", output: "file", wantErr: "close artifact: injected close failure", wantFile: "artifact"},
-		{name: "close-temp", mode: "close-failure", upload: true, wantErr: "close artifact: injected close failure", wantFile: "previous"},
-		{name: "write-and-close", mode: "write-close-failure", upload: true, wantErr: "pack image artifact: injected write failure", wantFile: "previous"},
+		{name: "write-file", mode: "write-failure", output: "file", wantErr: "pack image artifact: injected write failure", wantFile: "previous"},
+		{name: "write-temp", mode: "write-failure", upload: true, config: "empty", wantErr: "pack image artifact: injected write failure", wantFile: "previous"},
+		{name: "close-file", mode: "close-failure", output: "file", wantErr: "close artifact: injected close failure", wantFile: "previous"},
+		{name: "close-temp", mode: "close-failure", upload: true, config: "empty", wantErr: "close artifact: injected close failure", wantFile: "previous"},
+		{name: "write-and-close", mode: "write-close-failure", upload: true, config: "empty", wantErr: "pack image artifact: injected write failure", wantFile: "previous"},
 		{name: "stdout-write", mode: "closed-stdout", output: "-", wantErr: "pack image artifact: write", wantFile: "previous"},
-		{name: "stdout-copy", mode: "closed-stdout", output: "-", upload: true, wantErr: "write to stdout: write", wantFile: "previous"},
+		{name: "stdout-copy", mode: "closed-stdout", output: "-", upload: true, config: "empty", wantErr: "write to stdout: write", wantFile: "previous"},
 		{name: "broken-pipe-stream", output: "-", brokenPipe: true, wantErr: "pack image artifact:", wantFile: "previous"},
-		{name: "broken-pipe-copy", output: "-", upload: true, brokenPipe: true, wantErr: "write to stdout:", wantFile: "previous"},
+		{name: "broken-pipe-copy", output: "-", upload: true, config: "empty", brokenPipe: true, wantErr: "write to stdout:", wantFile: "previous"},
 		{name: "broken-pipe-key", mode: "upload-success", upload: true, config: "empty", brokenPipe: true, wantErr: "write manifest key:", wantFile: "previous"},
 		{name: "broken-pipe-key-named-output", mode: "upload-success", output: "file", upload: true, config: "empty", brokenPipe: true, wantErr: "write manifest key:", wantFile: "artifact"},
 		{name: "terminal-output", mode: "terminal-stdout", output: "-", wantErr: "export: refusing to write an image artifact to a terminal", wantFile: "previous"},
@@ -58,8 +58,8 @@ func TestExportLifecycle(t *testing.T) {
 		{name: "upload-file-success", mode: "upload-success", output: "file", upload: true, config: "empty", wantFile: "artifact"},
 		{name: "upload-stdout-success", mode: "upload-success", output: "-", upload: true, stream: true, config: "empty", wantFile: "previous"},
 		{name: "shared-scratch", output: "scratch-file", sharedScratch: true, wantFile: "artifact"},
-		{name: "shared-scratch-mkfs-failure", output: "file", sharedScratch: true, mkfsFail: true, wantErr: "exit status 7: fake mkfs failure", wantFile: "previous"},
-		{name: "shared-scratch-config-failure", output: "scratch-file", sharedScratch: true, upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "artifact"},
+		{name: "shared-scratch-mkfs-failure", output: "file", sharedScratch: true, mkfsFail: true, wantErr: "flatten: native plan: exit status 7: fake mkfs failure", wantFile: "previous"},
+		{name: "shared-scratch-config-failure", output: "scratch-file", sharedScratch: true, upload: true, config: "invalid", wantErr: "load config: manifest: parse", wantFile: "previous"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,6 +76,10 @@ func TestExportLifecycle(t *testing.T) {
 				output = filepath.Join(f.scratch, "user.img")
 				args = append(args, "--output", output)
 				scratchFiles["user.img"] = wantArtifact
+				writeExportFile(t, output, []byte("previous user artifact\n"))
+				if tc.wantFile == "previous" {
+					scratchFiles["user.img"] = []byte("previous user artifact\n")
+				}
 			case "directory":
 				args = append(args, "--output", filepath.Join(f.root, "cache"))
 			case "-":
@@ -262,11 +266,11 @@ func TestExportProcess(t *testing.T) {
 				writer = &exportTestWriter{File: f, mode: mode, root: root}
 				return writer, nil
 			},
-			ingestArtifact: func(path string, _ *manifest.Config, _ bool) (string, error) {
+			ingestArtifact: func(_ context.Context, path string, _ *manifest.Config, _ bool) (string, error) {
 				if writer == nil || !writer.closed {
 					return "", errors.New("test: artifact writer still open at ingest")
 				}
-				paths, err := filepath.Glob(filepath.Join(root, "scratch", "flatten-erofs-*.img"))
+				paths, err := filepath.Glob(filepath.Join(root, "scratch", "flatten-prepared-*"))
 				if err != nil || len(paths) != 0 {
 					return "", fmt.Errorf("test: raw EROFS still present at ingest: %v, %v", paths, err)
 				}
@@ -308,7 +312,7 @@ func checkExportRawClosed(scratch string) error {
 		}
 		// Linux permits unlink while open; that would retain the raw disk space
 		// until the descriptor closes, despite an empty scratch listing.
-		if strings.HasPrefix(target, filepath.Join(scratch, "flatten-erofs-")) {
+		if strings.HasPrefix(target, filepath.Join(scratch, "flatten-prepared-")) {
 			return fmt.Errorf("test: raw EROFS still open at ingest: %s", target)
 		}
 	}

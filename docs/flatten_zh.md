@@ -32,7 +32,7 @@
 
 - **远程 registry 镜像**——镜像引用如 `nginx:1.27`、`gcr.io/ns/app@sha256:...`;
   `flatten-ctl` 直接拉取并展平(§2.3),拉取凭据经 `FLATTEN_REGISTRY_*` 环境变量注入,
-  层 blob 落入可跨进程共享的本地 OCI-layout 缓存;
+  显式 OCI-layout 缓存可跨进程共享；未设置 `cache.dir` 时层直接流式输入；
 - **Docker archive**(`docker save` 产物的 tar 流,stdin 或本地文件);
 - **已展平的 rootfs 目录**——位置参数是一个本地目录时,mkfs.erofs 直接就地读取
   该目录出图,不复制 staging 树、不修改源树(§2.1 的目录源小节);仍会读取数据并写输出。
@@ -104,8 +104,8 @@ registry/archive 展平保留属主与权限位(§4.3),需要 root 或 `CAP_CHOW
 的 digest。脚本应分开这些输出模式:当前 `--upload --output -` 会在工件之后追加
 manifest key,而 `--upload --print-digest` 会输出多个值。捕获 key 时使用命名
 `--output` 或不把工件输出到 stdout。`export`/`cache gc` 经 `--no-progress` 关闭进度。
-拉取按层打 `pull: <done>/<total> layers`(只计缓存未命中的层),展平按阶段打
-`flatten: ...`,`--upload` 上传打 `upload: ...`(百分比+速率);字节型进度 2s 节流。
+流式导出按准备阶段打印 `flatten: ...`，上传打印 `upload: ...`（百分比和速率）；
+字节型进度按 2 秒节流。完整下载入口 `remote.Pull` 仍保留独立的层计数进度回调。
 
 ### 2.1 `flatten-ctl export`
 
@@ -171,8 +171,9 @@ flatten-ctl export --output big.img --config flatten.yaml ./big.tar
 该目录——没有 staging 拷贝,源树永不被修改(时间戳归一靠 `-T0 --ignore-mtime`
 在镜像层完成),保留属主只需要对树的读权限(导出完整 rootfs 用 root 跑)。被
 `--skip` / `--skip-mounts` 排除的路径**节点整体消失**(目录本身也不在镜像里);
-mkfs 的原始输出落在 rootfs 内时会自动排除;最终工件若位于正在导出的 rootfs 内,
-应将输出和 scratch 都放在被排除的挂载点,避免下一次导出吞入前一次的工件。
+调用者必须在导出前停止所有写入活动。共同选集排除自有 scratch、计划、pending 输出、
+目标路径及已发现的别名，规划、读取和最终校验始终使用此选集。导出 Guest 根目录时，
+可将 scratch 和输出放在被排除的挂载点。
 导出 `/` 必须带 `--skip-mounts`(否则会走读 /proc、/sys)。registry 专属 flags(`--platform`/`--print-digest`/
 `--registry`/`--archive`)与目录源互斥。
 
@@ -192,38 +193,34 @@ flatten-ctl export --skip-mounts --upload --manifest-config m.yaml /srv/rootfs
 
 #### 临时文件与失败处理
 
-Export 将原始 EROFS payload 写入 scratch 父目录下的 `flatten-erofs-*.img`。
-父目录按 `--tmpdir`、配置中的 `tmpdir`、系统临时目录（`TMPDIR`，通常为 `/tmp`）
-的优先级选择。封装成功且原始源文件和工件写入句柄均关闭后，立即删除该文件，
-然后才将已封装工件复制到 stdout 或开始上传。
+默认 Registry 导出只保留一个私有 rootfs 和有界 Plan 元数据，直接向不可 seek 的
+stdout 等 writer 输出现有工件，不保存整镜像压缩层、mkfs 私有数据 blob 或 raw
+中间文件。scratch 父目录依次取 `--tmpdir`、配置 `tmpdir`、`$TMPDIR` 或 `/tmp`。
 
 | 资源 | 生命周期与失败行为 |
 |---|---|
-| 内部原始文件 `flatten-erofs-*.img` | 封装完成后删除；export 返回错误时也会删除，包括 mkfs 写出部分内容后失败的情况。 |
-| 内部工件 `flatten-image-*.img` | 用于未指定 `--output` 的 `--upload`，或 `--upload --output -`。export 返回时无论成功还是失败都会删除，包括 manifest 配置无效和 ingest 失败。 |
-| 指定路径的 `--output` | 成功和失败时均保留，包括上传失败。仍然直接创建或截断该路径；封装、写入或关闭失败可能留下不完整工件。清理不会删除或恢复该文件。 |
-| 输入归档、源 rootfs、持久缓存、无关文件及 scratch 父目录 | export 的临时文件清理不会删除这些资源。持久缓存仍遵循正常的淘汰策略（§2.4）。 |
+| 私有 rootfs、Plan/layout 和 FD | 由 `PreparedImage` 持有到输出结束；Close 等待工作退出再释放。半应用失败使整个 rootfs 失效，重试从固定输入、新 scratch 开始。 |
+| Docker-save 输入 | 可 seek 文件原位建索引；不可 seek 输入只保留一份有界外层 spool，全部层校验后、规划前删除。不再单独解出内层 tar。 |
+| 最终工件 P | 仅 stdout 时直接流式输出；上传/复读保留一份必要 P，成功或失败后清理。 |
+| 命名 `--output` | 先写同目录 pending 文件；writer Close、最终校验、prepared 资源释放和请求的上传均成功后才原子改名。失败保留已有目标文件。 |
+| 显式持久缓存 | 完成态 blob 不随任务删除。取消先等待预取退出，再删除本次 pending；GC 独立执行（§2.4）。 |
+| 调用者目录、输入归档、无关文件及 scratch 父目录 | 不由任务资源清理删除。 |
 
-操作错误会在所拥有的资源完成释放后才传给外层 CLI；CLI 随后向 stderr 输出
-`error: ...` 并以状态码 1 退出。下游读取方关闭 stdout 时，export 会清理自己的
-临时文件，向 stderr 报告管道断开（broken pipe），并以状态码 1 退出。
-工件字节和现有 stdout 模式保持不变，包括
-`--upload --output -` 在工件后追加 key 的行为。`SIGKILL` 等突然终止不会执行
-Go defer，可能留下 scratch 文件；这里处理的是普通成功和失败时的清理，
-不提供崩溃恢复或陈旧文件扫描服务。
+取消会关闭拥有的输入 body，等待 applier 与 native 进程真正结束再清理。stdout
+断管走同一错误返回和清理路径。SIGKILL 无法执行清理；这里不提供全局遗留文件
+清扫器。`--upload --output -` 仍在工件后追加 manifest key。
 
-维护中的生命周期回归测试无需 root、registry/store、网络访问或真实的 mkfs
-可执行文件即可运行（Go 依赖须已缓存）：
+维护中的生命周期回归使用真实 native 工具，并按调用注入 writer/Close/upload 故障：
 
 ```bash
-GOFLAGS=-p=2 GOMAXPROCS=2 go test ./cmd/flatten-ctl
+make -C native-deps erofs
+MKFS_EROFS_PATH="$PWD/native-deps/bin/$(uname -m)/mkfs.erofs" \
+    GOFLAGS=-p=2 GOMAXPROCS=2 go test -race ./cmd/flatten-ctl
 ```
 
-测试使用小型本地假 mkfs，以及每次调用独立的写入、关闭、上传替代实现，检查
-失败清理、ingest 前释放原始文件、用户文件保留、CLI 退出行为（包括 stdout 管道
-读取端已关闭的情况及 SIGPIPE 行为恢复）及测试夹具工件的
-完整字节一致性。它们不验证真实 EROFS 构建或在线 registry/store 集成；这些内容
-仍由 [E2E 流程](../test/e2e/README.md) 覆盖（该流程文档当前仅提供英文版本）。
+覆盖原子输出、ingest 前资源释放、用户文件保留、断管和与普通 native 布局的工件
+身份对照。缺少 native 工具时相应用例会跳过；真实 Guest 和在线 store 验收使用
+[既有 E2E 入口](../test/e2e/README.md)。
 
 ### 2.2 `flatten-ctl info` — 检视镜像
 
@@ -303,12 +300,14 @@ flatten-ctl info --json my-app.img | jq '.config.Entrypoint'
 tmpdir: ""                     # 每次运行临时目录的父目录(空 = $TMPDIR 或 /tmp)
 platform: linux/amd64          # 空 = 跟随宿主架构(linux/$GOARCH);--platform 覆盖
 insecure: false                # 允许走纯 HTTP 的 registry(dev/私有);不影响 TLS 证书校验
-pull_jobs: 4                   # 并发下载层数(下载并行、apply 串行)
+pull_jobs: 4                   # 既有 remote.Pull 完整下载入口的并发数
 tls:                           # HTTPS 证书校验(registry 与 CDN blob 重定向均生效,见下)
   ca_cert: ""                  # 追加信任的 CA bundle 路径(PEM,可含多证书)
   insecure_skip_verify: false  # 完全关闭证书校验(不安全;优先用 ca_cert)
 cache:
-  dir: ""                      # OCI-layout 持久缓存根;空(默认)= 临时缓存(tmpdir 下,跑完清理)
+  dir: ""                      # OCI-layout 持久缓存根;空 = 直接流式输入
+  in_flight_bytes: 256MiB      # pending 压缩字节预算，当前层优先
+  required: false             # 超预算层默认 bypass；true 则报错
   max_size: 10GiB              # 上限,超出按 LRU 回收;"0" = 不限,仅手动 cache gc
 referer:
   validity: 720h               # 可选;referer put 写入 valid_at 的过期段
@@ -327,12 +326,12 @@ PEM CA bundle 追加进系统信任库,是信任此类私有根 CA 的正路;`in
 整体关闭证书校验,仅作 CA 不可得时的逃生口。与 `insecure` 正交:后者只决定 registry
 是否可走纯 HTTP,不影响 TLS 校验。
 
-**本地缓存**:标准 **OCI image layout** 目录(`oci-layout` + `index.json` +
-`blobs/<algo>/<hex>`),`crane`/`skopeo` 可直接检视。缓存命中判定 = `blobs/` 下该 digest
-是否存在(内容寻址,多个 `flatten-ctl` 进程共享同一目录天然安全);blob 边下边校 digest、
-原子落盘(temp→rename)。超出 `max_size` 时持 flock 按 LRU(mtime)回收到低水位,并以
-grace 期保护近期写入的 blob 不被并发拉取误删。`cache.dir` 指向共享路径即跨任务去重,指向
-每任务独立路径即隔离——由调用方按需配置。
+**本地缓存**：标准 OCI layout。只有显式 `cache.dir` 才暂存压缩候选层。当前层先
+取得预算，下一层完整 descriptor 能装入剩余字节预算时才预取；超预算层直接 stream
+bypass，`cache.required=true` 则拒绝。EOF 不发布命中：完整压缩 size/digest、解压
+DiffID/trailer 和 Close 全部成功才提交；命中仍在应用时重验。重复写入保留已有 inode。
+读写 lease 防止 GC 删除活动数据；超过宽限期的遗留 pending 可回收。完成态缓存不随
+任务删除；`max_size` 是 LRU 目标，不是即时文件系统配额。
 
 **多架构**:registry 引用常指 manifest index,按 `platform` 选出具体 image 再展平;
 `Architecture`/`Os` 仍原样投影进 config.json(§3.2),不做校验。
@@ -356,13 +355,18 @@ flatten-ctl referer put --owner <owner-token> --manifest-id <64hex> [--validity 
 `lookup` 解析源 → 平台镜像 digest `D`,直接探测 OCI 1.1 Referrers API。输出:
 
 ```json
-{"supported":true,"subject":"repo/app@sha256:...","hit":true,"manifest_id":"..."}
+{"conversion_semantics":"umoci-erofs-no-xattr-v1","supported":true,"subject":"repo/app@sha256:...","hit":true,"manifest_id":"..."}
 ```
 
 - `supported=false`:registry 不支持 Referrers API,调用方可按策略 fallback 或失败;
 - `supported=true, hit=false`:支持但没有 owner 匹配且格式有效、尚未过期的记录,
   调用方继续 `export` 并在宿主侧上传;
 - `supported=true, hit=true`:返回的 `manifest_id` 可由宿主校验后直接复用,无需拉取/展平。
+
+Lookup/writeback 使用实际生成器的转换政策。缺失或不匹配的 `conversion` 注解按
+miss 处理；原始层缓存和显式旧工件仍可读取。Builder 向 lookup/export/put 传递
+`--conversion-semantics`，旧或不兼容 Guest 工具会失败，不能把旧转换标成当前政策。
+该版本不进入制品身份，并独立于内部 Plan schema。
 
 `lookup` 严格校验 `valid_at`。缺失或格式错误的时间、未来的 import 时间、已经到期
 或早于 import 的 expiry 都作为 miss 跳过;存在多条有效记录时返回 import 时间最新者。
@@ -376,6 +380,7 @@ referrer 注解:
 ```
 vnd.kuasar.flatten-manifest.owner    = <hmac-hex> <referer_desc>
 vnd.kuasar.flatten-manifest.id       = <manifest_id>                        # ingest 产出的内容键
+vnd.kuasar.flatten-manifest.conversion = umoci-erofs-no-xattr-v1
 vnd.kuasar.flatten-manifest.valid_at = <import RFC3339>[ <expiry RFC3339>]
 ```
 
@@ -398,8 +403,7 @@ flatten-ctl cache info [--config <p>] [--cache-dir <D>]
 flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [--no-progress]
 ```
 
-`cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认临时缓存随 `export` 跑完即清,
-无需 gc。`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
+`cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认流式 `export` 不生成整镜像压缩层缓存，无需 gc。`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
 (或 `--cache-max-size` 覆盖)的上限,`"0"` 清空(grace 期内的除外)。缓存目录默认取
 `--config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
 执行回收(`export` 每次拉取后也会顺带回收)。grace 期与并发写入仍可能使占用
@@ -577,84 +581,85 @@ override 在上的合并,`Volumes` 并入 `mounts`。因此 image config 有 Ent
 
 ## 4. 算法
 
-### 4.1 layer 迭代
+### 4.1 输入与层生命周期
 
-展平引擎以 `Source` 抽象输入:Source 给出底→顶有序的层(每层一条**未压缩** tar 流)
-与原始 OCI image config JSON,两个实现共享同一个确定性 sink(`Build`):
+`remote.Stream` 在打开层之前固定平台 manifest、config、descriptor 和对应 DiffID。
+每次 `LayerInput.Open` 必须为同一不可变身份返回从零开始的新 body；prepared 操作
+拥有它，精确关闭一次并检查 Close 错误。gzip/zstd/plain 由明确媒体类型决定。
+tar EOF 不等于流结束：有界尾部读取覆盖完整未压缩 DiffID、压缩 size/digest 和
+decoder trailer。错误、超限或取消停止输入，不无限 drain。全部层成功前不输出工件。
+`remote.Pull` 保留完整下载、可重开的 Source 合同；旧 `Build(Source, ...)` 仍接受
+未压缩、可重开的层。
 
-- **docker-archive**:输入 tar 内含 `manifest.json`(层顺序 + image config 路径)与
-  各层 tarball;先解到临时目录,按 `manifest.json` 顺序逐层打开(gzip 层透明解压);
-- **registry**([accelerator/pkg/remote](https://github.com/kuasar-sandbox/accelerator/tree/main/pkg/remote)):层 blob 经本地 OCI-layout 缓存,按媒体类型解压
-  (gzip/zstd)成同样的未压缩 tar 流(§2.3)。
+`PrepareArchive` 校验外层成员、offset/length、结束标志及索引预算，按 manifest
+顺序开启层。可 seek 输入原位读取，管道只 spool 一次。`PrepareImage`、
+`PrepareArchive`、`PrepareDir` 返回的 `PreparedImage` 持有选定源、layout、计划和 FD。
+旧 `Flatten` 借用 reader；`PrepareArchive` 拥有并关闭传入 body。
+选定的 config 和层必须是普通成员。既有 Skopeo 旧格式别名
+`<hex>/layer.tar -> ../<diff-id>.tar` 仅在目标为选定普通层时接受，只建立索引，
+不跟随或提取该链接。其他外层链接和 sparse 成员均拒绝。
 
-`Build` 把每层 tar entry 流式应用到磁盘上的临时 staging rootfs:上层 entry 覆盖下层
-同路径 entry;每个 entry 落盘后按 tar 头 chown+chmod 保留属主与权限位(含
-setuid/setgid/sticky;先 chown 后 chmod,因为 chown 会清掉 setuid/setgid)——
-这一步要求 root/CAP_CHOWN(§2)。image config 按 §3.2 投影,最后追加进 ZIP。
-目录源走独立的就地 `BuildFromDir` 路径(§2.1)。
+### 4.2 OCI 应用与稳定源
 
-### 4.2 whiteout 处理
+Linux 适配调用 **umoci v0.6.0** 层 API，不引入其 CLI、CAS 或 runtime bundle 生成。
+保留数值 UID/GID、mode、普通目录和类型替换、implicit parent、硬链接身份及特殊文件。
+迟到的 `.wh.<name>`、`.wh..wh..opq` 只影响下层条目，不删除同层新增条目。
+权限不足明确失败。受支持的层 xattr 在私有 rootfs 中应用并核对；最终输出政策见 §4.3。
+半应用树整体废弃，不原地重放同层模拟回滚。
 
-OCI 镜像规范用特殊文件名表达"删除":
+私有 rootfs 在层应用后停止写入。已有目录须由调用者在准备和输出全程保持稳定；
+选集和摘要只能检测变化，不能把并发目录变成原子快照。规划、读取和最终校验共享
+同一选集，包括 `Skip`、`SkipMounts` 及全部自有 scratch/spool/layout/输出排除。
+读取产生的 atime 和排除区域内部变化不导致失效；纳入选集的元数据、链接、对象及
+目录成员变化会导致失效。
 
-- `.wh.<name>` —— 删除同目录下的 `<name>`(file 或 dir);
-- `.wh..wh..opq` —— 把所在目录标记为 opaque(其下所有底层条目都不可见)。
+### 4.3 布局与元数据政策
 
-`flatten-ctl` 在合并时识别这两类 marker,把对应条目从 staging rootfs 中移除,然
-后**不**把 marker 本身写进输出——最终 EROFS 只看到合并后的可见文件。
-
-### 4.3 元数据归一化(确定性的关键)
-
-为保证字节级可重复,以下字段在写入 EROFS 之前被强制归一化:
+维护中的 **erofs-utils v1.9.1** 补丁复用 native 扫描、排序、inode/NID、硬链接、
+superblock、块分配与 chunk 索引。约 1 MiB 批量读取内仍逐 4 KiB 使用完整 SHA-256
+去重；普通 raw 与 Plan 使用同一布局算法。
 
 | 字段 | 处理 |
 |---|---|
-| mtime / atime | staging 时间戳归零(epoch 0),EROFS 侧以 `-T0` 固定时间戳;目录源用 `--ignore-mtime`,不改源树。 |
-| uid / gid / mode | 保留原值(应用语义敏感:`/tmp` 须 1777、`/home/<user>` 须 user 属主)——按层 tar 头 chown+chmod,需 root/CAP_CHOWN(§2) |
-| inode 编号 | 由 `mkfs.erofs` 按确定顺序分配 |
-| 文件遍历顺序 | 字典序(`mkfs.erofs` 内部) |
-| hardlink | 在 staging 上重建为真实硬链接(同 inode);`-Ededupe` 另对重复数据块去重 |
-| 扩展属性(xattr) | 不写入(`-x-1` 禁用;层 tar 中的 xattr 不应用);因此 xattr 中的 file capabilities 与安全标签也不由此路径保留。 |
+| 时间与 UUID | `-T0 --ignore-mtime` 和全零 UUID 固定输出身份，不修改调用者目录。 |
+| UID/GID/mode | 保留源的数值属主和权限位；层应用权限不足失败。 |
+| inode、遍历、硬链接 | native 确定性排序和真实共享 inode；内容去重独立进行。 |
+| xattr | 最终 EROFS 固定 `-x-1`，**不输出 xattr、file capability 或安全标签**，即使它们已成功应用到私有 rootfs。 |
+| 压缩与设备 | 不压缩、单设备、4 KiB chunk，无隐式 raw/data-blob fallback。 |
 
-EROFS 特性取决于 `mkfs.erofs`。native 构建固定 erofs-utils **v1.9.1** 与源码摘要。
-跨节点比对需使用相同的固定可执行文件和设置;`MKFS_EROFS_PATH`/PATH 覆盖可能
-选择不同版本,不能忽略该输入。
+内部 Plan schema/能力、`image.ConversionSemantics` 和制品身份分别管理。Plan 声明
+逻辑长度、源身份/路径、有序目标和源 offset、length、SHA-256 及 padding。Reader
+拒绝未知能力、溢出、数量/字节超限、缺源/截断、重叠和越界。Native 地址空间预算
+覆盖去重与 inode/path 表；Go 预算覆盖源索引、decoder/applier 和 tarstream extent/
+sparse-map 元数据。默认预算有限，可通过库的 limits 结构配置。
 
-### 4.4 mkfs.erofs 调用
+### 4.4 顺序输出与接收条件
 
-`Build` 对 staging rootfs 执行 `mkfs.erofs`,flag 集固定:
+Native 退出并释放索引后才开始 emit。layout 中计划 payload 尚未物化的洞标为
+**Data**；`RunAt` 是可重复的纯元数据查询，不消费游标、不扫描零字节推断洞。
+每个 payload 块进入 writer 前核验计划摘要。现有 runtime-config 投影、tailzip 和
+加密 writer 保持不变。
 
-```
-mkfs.erofs -Ededupe --chunksize=4096 -T0 -b4096 -x-1 \
-    -U 00000000-0000-0000-0000-000000000000 --quiet <output> <staging-dir>
-```
+可选 tarstream 最终校验钩子在 payload 完成后、carrier digest marker、完整尾和
+加密终结记录之前执行，空源和全 Hole/Zero 源也执行。Prepared 输出用它重验选集和
+Plan/layout 身份。接收方必须同时要求完整工件身份/尾以及 producer/ingester 成功，
+才能 Ready 或写回转换结果；仅收到 payload 字节不表示成功。
 
-- `-Ededupe --chunksize=4096` —— 镜像内数据块去重 + chunk 化布局,缩小元数据体积、
-  稳定数据块偏移,最大化下游 CDC 跨镜像去重;
-- 不压缩 —— 原始字节才能被 CDC 分块跨镜像去重;
-- `-T0` / 固定 UUID / `-x-1` —— 固定时间戳、固定 UUID、禁 xattr,消除非确定性来源。
+显式 `WriteRaw` 使用同一 Plan；正常 CLI 不生成 raw 暂存。命名 raw 和 artifact
+均使用 pending 文件原子提交。`Close` 取消并等待活动工作，然后释放拥有的资源；
+调用者提供的任意输出 writer 须自行让阻塞的 Write 返回。
 
-目录源额外传 `--ignore-mtime` 和所选 `--exclude-path`。构建器把 mkfs 的 TMPDIR
-设为原始输出所在目录,使 dedup scratch 留在指定的 flatten 临时空间。
-
-完成后追加 ZIP:以 append 方式打开 payload,在 EROFS 段之后写一条 STORED
-`config.json` entry(§3.3),CLI 再将完整 payload 封装为 tarstream(§3.1)。
-
-在 guest-runtime 根目录执行 `make -C native-deps erofs` 构建 mkfs.erofs。
-`make flatten-ctl` 只构建 CLI;**`make build` 构建 flatten-ctl 和 sandbox-runtime.bundle**,
-并可能构建/组装 runtime 的 native 输入。运行期 mkfs.erofs 定位优先级:
-`MKFS_EROFS_PATH` > flatten-ctl 同目录 > `PATH`。
-
-文件系统格式支持跨 Host 架构构建,但不会转换应用二进制,也不能免除 Guest
-内核对所用 EROFS 特性的支持要求。
+`make -C native-deps erofs` 构建维护中的 native 工具，`make build` 沿用现有 CLI 和
+runtime bundle 打包路径。Native 查找顺序仍为 `MKFS_EROFS_PATH`、CLI 同目录、PATH。
+缺少 Plan 能力明确失败，不自动回退到高空间路径。
 
 ## 5. 设计决策
 
 ### 5.1 为什么是 EROFS 而非 ext4 / squashfs
 
 - **只读、不可变 base**:EROFS 适合内容寻址 chunk 和可复用 backing 数据。
-- **单一 payload**:适合单工件传递、manifest 上传和块设备访问;CLI 先落原始
-  临时输出,再封装或流出。
+- **单一 payload**:适合单工件传递、manifest 上传和块设备访问；CLI 从稳定源和
+  Plan 顺序输出工件，不需要完整 raw 临时文件。
 - **可移植磁盘格式**:可跨 Host 架构构建;应用仍须匹配实际执行架构。
 - **squashfs 对比**:平台选择不压缩、chunk 布局的 EROFS 以配合数据/去重路径。
   squashfs 也可共享不可变 backing 数据,这里没有普适的密度劣势证据。
