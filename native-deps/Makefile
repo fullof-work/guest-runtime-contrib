@@ -206,6 +206,7 @@ test-scripts:
 	bash deps/test-erofs.sh
 
 test-erofs: erofs
+	$(DEPS_ENV) EROFS_TARBALL="$(EROFS_TARBALL)" EROFS_TARBALL_SHA256="$(EROFS_TARBALL_SHA256)" bash deps/test-erofs-read.sh
 	$(DEPS_ENV) EROFS_TARBALL="$(EROFS_TARBALL)" EROFS_TARBALL_SHA256="$(EROFS_TARBALL_SHA256)" bash deps/test-erofs-sha256.sh
 	$(DEPS_ENV) EROFS_TARBALL="$(EROFS_TARBALL)" EROFS_TARBALL_SHA256="$(EROFS_TARBALL_SHA256)" bash deps/test-erofs-real.sh
 	$(DEPS_ENV) EROFS_TARBALL="$(EROFS_TARBALL)" EROFS_TARBALL_SHA256="$(EROFS_TARBALL_SHA256)" bash deps/test-erofs-recipe.sh
