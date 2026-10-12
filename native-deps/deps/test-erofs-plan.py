@@ -114,3 +114,17 @@ for option in ("-T1", "-x0", "-b8192", "--plan-bytes=192", "--offset=4096", "--p
                              str(failed) + ".layout", str(root)], capture_output=True, timeout=30)
     assert result.returncode != 0, (option, "accepted unsupported plan policy/budget")
 print("test-erofs-plan: policy/budget rejection PASS")
+
+# Native callers may put all outputs in the source itself, including a layout
+# with a pre-existing hard-link alias. None may enter the native inode index.
+root = work / "plan-in-source"
+root.mkdir()
+(root / "payload").write_bytes(b"selected source" * 1000)
+full = work / "plan-in-source.raw"
+subprocess.run([str(tools / "mkfs.erofs"), *flags, str(full), str(root)], check=True)
+layout, plan = root / "layout", root / "plan"
+layout.touch()
+os.link(layout, root / "layout-alias")
+subprocess.run([str(tools / "mkfs.erofs"), *flags, "--plan=" + str(plan), str(layout), str(root)], check=True)
+assert reconstruct(root, layout, plan) == full.read_bytes(), "native outputs entered source selection"
+print("test-erofs-plan: source-contained output exclusion PASS")

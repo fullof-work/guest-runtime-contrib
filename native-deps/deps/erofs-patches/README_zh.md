@@ -8,7 +8,7 @@
 
 `0004-single-device-plan.patch` 在同一套 native 目录扫描、inode/chunk 索引及块分配器上增加可选规划输出，普通 raw 调用保留原有布局。Plan 路径按至多 1 MiB 批量读取，同时保持 4 KiB chunk、完整 SHA-256 去重、单设备、不压缩、不输出 xattr、全零 UUID 和 epoch 时间戳。稀疏 layout 保存元数据，唯一数据区域由源引用表示，不生成私有数据 blob。该虚拟区域虽在 layout 文件中是洞，在最终镜像中仍必须作为 Data；不通过内容为零推导 Hole。
 
-`--plan-version` 返回 `erofs-plan 1 sha256-4k-single-device`。`--plan=PATH` 以排他创建方式写入私有 header、`PATH.sources` 和 `PATH.chunks`；这些文件是内部生产者/消费者合同，不是 artifact 格式。`--plan-memory=BYTES` 限制 native 地址空间，覆盖去重及 inode/路径表；`--plan-bytes=BYTES` 限制计划和实际物化的 layout 元数据。两者默认均为 512 MiB。超预算或请求不支持的输出政策时失败，调用方不得静默回退到 raw 暂存。
+`--plan-version` 返回 `erofs-plan 1 sha256-4k-single-device`。`--plan=PATH` 以排他创建方式写入私有 header、`PATH.sources` 和 `PATH.chunks`；这些文件是内部生产者/消费者合同，不是 artifact 格式。Native 扫描按设备/inode 身份排除这些文件及 layout，输出位于源内时也排除它们的别名。`--plan-memory=BYTES` 限制 native 地址空间，覆盖去重及 inode/路径表；`--plan-bytes=BYTES` 限制计划和实际物化的 layout 元数据。两者默认均为 512 MiB。超预算或请求不支持的输出政策时失败，调用方不得静默回退到 raw 暂存。
 
 小端 v1 header 共 192 字节：八字节 `KERPLAN\0` magic；u32 版本/header 长度；u64 feature、逻辑长度、数据区域 offset/length、chunk/source 数量及索引字节数；分别覆盖 layout 元数据、chunks 和 sources 的三个完整 SHA-256；最后为 16 字节保留零。每条 chunk 记录为 64 字节，含 u64 目标相对 offset、源 offset 和源 ID，u32 length/padding，以及未填充数据的完整 SHA-256。目标 offset 按 4 KiB 连续排列，源 ID 非递减。每条 source 记录由 80 字节身份头及 root-relative 路径组成：ID、设备、inode、size、mtime/ctime 秒数及纳秒、mode、UID、GID、路径长度和链接数；不包含 atime。消费者检查边界、溢出、记录、身份、摘要和 padding，并保持源稳定直到输出及最终校验完成。
 

@@ -1,13 +1,16 @@
 --- /dev/null
 +++ b/include/erofs/plan.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,19 @@
 +/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
 +#ifndef __EROFS_PLAN_H
 +#define __EROFS_PLAN_H
 +
 +#include "erofs/internal.h"
++#include <sys/stat.h>
 +
 +bool erofs_plan_enabled(void);
++bool erofs_plan_is_output(const struct stat *st);
++int erofs_plan_layout(int fd);
 +int erofs_plan_init(const char *path, u64 memory_limit, u64 byte_limit);
 +int erofs_plan_source(const char *path, int fd, u64 *id);
 +int erofs_plan_check_source(int fd, u64 id);
@@ -19,7 +22,7 @@
 +#endif
 --- /dev/null
 +++ b/lib/plan.c
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,337 @@
 +// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
 +/* Single-device directory plans retain the native layout and 4 KiB SHA-256
 + * deduplication. The chunk blob is represented by ordered source references. */
@@ -42,6 +45,7 @@
 +	u64 byte_limit, source_count, chunk_count, source_bytes;
 +	u64 data_offset, data_length;
 +	struct stat source_stat;
++	struct stat outputs[4];
 +	u8 chunk_buffer[65536];
 +	size_t chunk_used;
 +} plan = { .header = -1, .chunks = -1, .sources = -1 };
@@ -88,6 +92,25 @@
 +	return plan.enabled;
 +}
 +
++bool erofs_plan_is_output(const struct stat *st)
++{
++	unsigned int i;
++	if (!plan.enabled || !S_ISREG(st->st_mode))
++		return false;
++	for (i = 0; i < 4; ++i)
++		if (st->st_dev == plan.outputs[i].st_dev &&
++		    st->st_ino == plan.outputs[i].st_ino)
++			return true;
++	return false;
++}
++
++int erofs_plan_layout(int fd)
++{
++	if (!plan.enabled)
++		return 0;
++	return fstat(fd, &plan.outputs[3]) ? -errno : 0;
++}
++
 +int erofs_plan_init(const char *path, u64 memory_limit, u64 byte_limit)
 +{
 +	struct rlimit limit;
@@ -124,6 +147,10 @@
 +	plan.sources = open(name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
 +	free(name);
 +	if (plan.sources < 0)
++		return -errno;
++	if (fstat(plan.header, &plan.outputs[0]) ||
++	    fstat(plan.chunks, &plan.outputs[1]) ||
++	    fstat(plan.sources, &plan.outputs[2]))
 +		return -errno;
 +	plan.enabled = true;
 +	return 0;
@@ -529,6 +556,39 @@
  		return -errno;
  
  	hashmap_init(&blob_hashmap, erofs_blob_hashmap_cmp, 0);
+--- a/lib/inode.c
++++ b/lib/inode.c
+@@ -21,6 +21,7 @@
+ #include "erofs/inode.h"
+ #include "erofs/xattr.h"
+ #include "erofs/exclude.h"
++#include "erofs/plan.h"
+ #include "erofs/block_list.h"
+ #include "erofs/compress_hints.h"
+ #include "erofs/blobchunk.h"
+@@ -1392,6 +1393,10 @@
+ 	ret = lstat(path, &st);
+ 	if (ret)
+ 		return ERR_PTR(-errno);
++	/* Exclude native-owned outputs by identity, including hard-link and
++	 * bind aliases, before they can enter inode/chunk indexes. */
++	if (erofs_plan_is_output(&st))
++		return NULL;
+ 
+ 	/*
+ 	 * lookup in hash table first, if it already exists we have a
+@@ -1845,6 +1850,11 @@
+ 			goto err_closedir;
+ 
+ 		inode = erofs_iget_from_local(im, buf);
++		if (!inode) {
++			list_del(&d->d_child);
++			free(d);
++			continue;
++		}
+ 		if (IS_ERR(inode)) {
+ 			ret = PTR_ERR(inode);
+ 			goto err_closedir;
 --- a/mkfs/main.c
 +++ b/mkfs/main.c
 @@ -25,6 +25,7 @@
@@ -617,7 +677,16 @@
  	g_sbi.fixed_nsec = 0;
  	if (mkfscfg.unix_timestamp != -1)
  		importer_params.build_time = mkfscfg.unix_timestamp;
-@@ -2155,6 +2203,9 @@
+@@ -1861,6 +1909,8 @@
+ 
+ 	err = erofs_dev_open(&g_sbi, cfg.c_img_path, O_RDWR |
+ 				(incremental_mode ? 0 : O_TRUNC));
++	if (!err)
++		err = erofs_plan_layout(g_sbi.bdev.fd);
+ 	if (err) {
+ 		fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+ 		goto exit;
+@@ -2155,6 +2205,9 @@
  			close(erofstar.ios.dumpfd);
  	}
  	erofs_importer_exit(&importer);
