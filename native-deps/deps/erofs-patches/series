@@ -1,2 +1,3 @@
 0002-explicit-libgcrypt-sha256.patch
 0003-exact-chunk-read.patch
+0004-single-device-plan.patch
