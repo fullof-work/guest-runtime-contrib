@@ -10,6 +10,59 @@
 
 ssize_t __real_read(int fd, void *buf, size_t count);
 ssize_t __real___read_chk(int fd, void *buf, size_t count, size_t buflen);
+ssize_t __real_pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t __real_pread64(int fd, void *buf, size_t count, off64_t offset);
+
+static ssize_t inject_pread(int fd, void *buf, size_t count, off64_t offset,
+			    int wide)
+{
+	const char *target = getenv("KUASAR_TEST_READ_TARGET");
+	const char *mode = getenv("KUASAR_TEST_READ_MODE");
+	struct stat wanted, current;
+	static int injected;
+
+	if (target && mode && count && !stat(target, &wanted) &&
+	    !fstat(fd, &current) && wanted.st_dev == current.st_dev &&
+	    wanted.st_ino == current.st_ino) {
+		if (!strcmp(mode, "eintr") && !injected++) {
+			fputs("pread-injected:eintr\n", stderr);
+			errno = EINTR;
+			return -1;
+		}
+		if (!strcmp(mode, "short")) {
+			if (!injected++)
+				fputs("pread-injected:short\n", stderr);
+			if (count > 97)
+				count = 97;
+		}
+		if (!strcmp(mode, "eio") || !strcmp(mode, "eof") ||
+		    !strcmp(mode, "partial-eio")) {
+			/* Force positive progress before a failure, even if the entire
+			 * fixture fits inside a single 1 MiB batch. */
+			if (offset >= 0 && offset < 4096 && count > (size_t)(4096 - offset))
+				count = 4096 - offset;
+			else if (offset == 4096 && !strcmp(mode, "partial-eio"))
+				count = count > 17 ? 17 : count;
+			else if (offset >= 4096) {
+				fprintf(stderr, "pread-injected:%s\n", mode);
+				errno = EIO;
+				return !strcmp(mode, "eof") ? 0 : -1;
+			}
+		}
+	}
+	return wide ? __real_pread64(fd, buf, count, offset) :
+		__real_pread(fd, buf, count, offset);
+}
+
+ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t offset)
+{
+	return inject_pread(fd, buf, count, offset, 0);
+}
+
+ssize_t __wrap_pread64(int fd, void *buf, size_t count, off64_t offset)
+{
+	return inject_pread(fd, buf, count, offset, 1);
+}
 
 ssize_t __wrap_read(int fd, void *buf, size_t count)
 {

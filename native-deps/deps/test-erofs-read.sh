@@ -18,7 +18,7 @@ cp -a "$test_source" "$work/src"
 read -r -a compiler <<< "${CC:-gcc}"
 "${compiler[@]}" -Wall -Wextra -Werror -c "$script_dir/test-erofs-read-wrap.c" -o "$work/wrap.o"
 rm -f "$work/src/mkfs/mkfs.erofs" "$work/src/mkfs/.libs/mkfs.erofs"
-make -C "$work/src/mkfs" LDFLAGS="${LDFLAGS:-} -all-static $work/wrap.o -Wl,--wrap=read -Wl,--wrap=__read_chk" \
+make -C "$work/src/mkfs" LDFLAGS="${LDFLAGS:-} -all-static $work/wrap.o -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=pread -Wl,--wrap=pread64" \
     > "$BUILD_DIR/tests/exact-read-build.log" 2>&1 \
     || { cat "$BUILD_DIR/tests/exact-read-build.log" >&2; exit 1; }
 if readelf -l "$work/src/mkfs/mkfs.erofs" | grep -q INTERP; then
@@ -26,3 +26,4 @@ if readelf -l "$work/src/mkfs/mkfs.erofs" | grep -q INTERP; then
     exit 1
 fi
 python3 "$script_dir/test-erofs-read.py" "$BINDIR" "$work/src/mkfs/mkfs.erofs" "$work"
+python3 "$script_dir/test-erofs-plan.py" "$BINDIR" "$work/src/mkfs/mkfs.erofs" "$work"
