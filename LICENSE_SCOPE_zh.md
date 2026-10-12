@@ -17,3 +17,7 @@
 `native-deps/deps/erofs-patches/0003-exact-chunk-read.patch` 保留 `lib/blobchunk.c` 的 `GPL-2.0-or-later OR Apache-2.0` 声明。相邻 `.license` 提供机器可读映射；适用上文链接的 Apache 和 GPL 文本，源码声明允许后续 GPL 版本。项目原创的读取故障注入测试 helper 适用根目录 Apache-2.0 许可证，不链接进发布工具。
 
 `0004-single-device-plan.patch` 修改 `mkfs/main.c`、库构建清单、`lib/blobchunk.c` 和 `lib/inode.c`，并增加 Plan 接口与实现。其 sidecar 标记为 `GPL-2.0-or-later AND (GPL-2.0-or-later OR Apache-2.0)`，保留受影响上游文件的声明。计划重建与批量读取故障注入测试使用根目录 Apache-2.0 许可证，不进入 native payload。有序补丁字节、sidecar、应用 helper 及实际静态输入仍纳入配方和发布材料身份。
+
+## Go 子模块声明
+
+`scripts/release-notices/rootless-containers-proto/COPYING` 是上游提交 `4cd87ebadd670f849a518618bc9862e703f9baa5` 中未经修改的 Apache-2.0 许可证。该提交的 `go-proto` 模块归档遗漏了仓库根目录许可证。打包仅为 `github.com/rootless-containers/proto/go-proto@v0.0.0-20230421021042-4cd87ebadd67` 补充这份固定声明，校验其摘要，并保留模块原有的来源和校验和清单。相邻 `NOTICE` 记录来源；其他模块或版本仍必须收集许可证材料。
