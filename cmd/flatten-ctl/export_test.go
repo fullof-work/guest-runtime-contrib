@@ -266,15 +266,15 @@ func TestExportProcess(t *testing.T) {
 	} else {
 		var writer *exportTestWriter
 		ops := exportIO{
-			createArtifact: func(path string) (io.WriteCloser, error) {
-				f, err := os.Create(path)
+			createArtifact: func(file *os.File) (io.WriteCloser, error) {
+				owned, err := artifactWriter(file)
 				if err != nil {
 					return nil, err
 				}
-				writer = &exportTestWriter{File: f, mode: mode, root: root}
+				writer = &exportTestWriter{File: owned.(*os.File), mode: mode, root: root}
 				return writer, nil
 			},
-			ingestArtifact: func(_ context.Context, path string, _ *manifest.Config, _ bool) (string, error) {
+			ingestArtifact: func(_ context.Context, file *os.File, _ *manifest.Config, _ bool) (string, error) {
 				if writer == nil || !writer.closed {
 					return "", errors.New("test: artifact writer still open at ingest")
 				}
@@ -285,7 +285,11 @@ func TestExportProcess(t *testing.T) {
 				if err := checkExportRawClosed(filepath.Join(root, "scratch")); err != nil {
 					return "", err
 				}
-				b, err := os.ReadFile(path)
+				info, err := file.Stat()
+				if err != nil {
+					return "", err
+				}
+				b, err := io.ReadAll(io.NewSectionReader(file, 0, info.Size()))
 				if err != nil {
 					return "", err
 				}
@@ -785,5 +789,126 @@ func TestExportBlockedStdoutSignalEscalation(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type replaceArtifactOnClose struct {
+	io.WriteCloser
+	replace func()
+}
+
+func (w replaceArtifactOnClose) Close() error {
+	err := w.WriteCloser.Close()
+	w.replace()
+	return err
+}
+
+func TestExportRejectsReplacedPendingArtifact(t *testing.T) {
+	for _, stage := range []string{"prepare", "writer-close", "upload"} {
+		for _, kind := range []string{"symlink", "regular"} {
+			t.Run(stage+"/"+kind, func(t *testing.T) {
+				f := newExportFixture(t)
+				sentinel := filepath.Join(f.root, "sentinel")
+				var pending string
+				replace := func() {
+					t.Helper()
+					if err := os.Remove(pending); err != nil {
+						t.Fatal(err)
+					}
+					if kind == "symlink" {
+						if err := os.Symlink(sentinel, pending); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						writeExportFile(t, pending, []byte("substituted artifact"))
+					}
+				}
+				uploads := 0
+				ops := exportIO{
+					createArtifact: func(file *os.File) (io.WriteCloser, error) {
+						w, err := artifactWriter(file)
+						if err != nil {
+							return nil, err
+						}
+						if stage == "writer-close" {
+							return replaceArtifactOnClose{w, replace}, nil
+						}
+						return w, nil
+					},
+					ingestArtifact: func(_ context.Context, file *os.File, _ *manifest.Config, _ bool) (string, error) {
+						uploads++
+						if stage != "upload" {
+							t.Fatal("replaced artifact reached uploader")
+						}
+						replace()
+						info, err := file.Stat()
+						if err != nil {
+							return "", err
+						}
+						got, err := io.ReadAll(io.NewSectionReader(file, 0, info.Size()))
+						if err != nil || !bytes.Equal(got, expectedExportArtifact(t, f)) {
+							t.Fatalf("upload was not bound to reserved artifact: %v", err)
+						}
+						return strings.Repeat("a", 64), nil
+					},
+				}
+				err := writePreparedExport(context.Background(), f.output, true, f.scratch, nil, true,
+					func(excluded []string) (*flatten.PreparedImage, error) {
+						pending = filepath.Join(excluded[0], "image")
+						info, err := os.Stat(excluded[0])
+						if err != nil || info.Mode().Perm() != 0700 {
+							t.Fatalf("staging privacy: %v %v", info, err)
+						}
+						if stage == "prepare" {
+							replace()
+						}
+						return flatten.PrepareDir(context.Background(), f.source, flatten.Options{TmpDir: f.scratch}, flatten.DirOptions{OutputPaths: excluded})
+					}, ops)
+				if err == nil || !strings.Contains(err.Error(), "temporary object was replaced") {
+					t.Fatalf("replacement accepted: %v", err)
+				}
+				if stage == "upload" && uploads != 1 {
+					t.Fatalf("uploads=%d", uploads)
+				}
+				assertExportFile(t, sentinel, f.retained[sentinel])
+				assertExportFile(t, f.output, []byte("previous user artifact\n"))
+				assertExportScratch(t, f.scratch, nil)
+				pendingDirs, err := filepath.Glob(filepath.Join(f.root, ".flatten-artifact-*"))
+				if err != nil || len(pendingDirs) != 0 {
+					t.Fatalf("pending artifacts remain: %v %v", pendingDirs, err)
+				}
+			})
+		}
+	}
+}
+
+func TestPendingArtifactRejectsReplacedDirectory(t *testing.T) {
+	root := t.TempDir()
+	output := filepath.Join(root, "output")
+	writeExportFile(t, output, []byte("previous"))
+	p, err := reserveArtifact(output, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := p.path + "-moved"
+	if err := os.Rename(p.path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(p.path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(p.path, "image")
+	writeExportFile(t, sentinel, []byte("replacement directory"))
+	if err := p.commit(); err == nil {
+		t.Fatal("replaced directory committed")
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertExportFile(t, output, []byte("previous"))
+	assertExportFile(t, sentinel, []byte("replacement directory"))
+	entries, err := os.ReadDir(original)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("owned payload remains: %v %v", entries, err)
 	}
 }

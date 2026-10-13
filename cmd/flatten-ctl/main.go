@@ -44,6 +44,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/guest-runtime/internal/util"
 )
 
@@ -110,8 +111,8 @@ func cmdExport(args []string) {
 // exportIO holds the artifact writer and uploader for one export invocation.
 // Nil functions select the normal file and manifest implementations.
 type exportIO struct {
-	createArtifact func(string) (io.WriteCloser, error)
-	ingestArtifact func(context.Context, string, *manifest.Config, bool) (string, error)
+	createArtifact func(*os.File) (io.WriteCloser, error)
+	ingestArtifact func(context.Context, *os.File, *manifest.Config, bool) (string, error)
 }
 
 // runExport owns scratch files. Return errors through this scope so cleanup
@@ -119,7 +120,7 @@ type exportIO struct {
 // happens before any resources are acquired.
 func runExport(args []string, ops exportIO) error {
 	if ops.createArtifact == nil {
-		ops.createArtifact = func(path string) (io.WriteCloser, error) { return os.Create(path) }
+		ops.createArtifact = artifactWriter
 	}
 	if ops.ingestArtifact == nil {
 		ops.ingestArtifact = ingestEROFS
@@ -286,20 +287,29 @@ func isRemoteSource(input string, forceRegistry, forceArchive bool) bool {
 	return remote.LooksLikeReference(input)
 }
 
-// ingestEROFS uploads the EROFS at path into the content store via the
+// ingestEROFS uploads the reserved artifact into the content store via the
 // manifest ingester and returns the hex manifest key.
-func ingestEROFS(ctx context.Context, path string, mcfg *manifest.Config, noProgress bool) (_ string, retErr error) {
+func ingestEROFS(ctx context.Context, file *os.File, mcfg *manifest.Config, noProgress bool) (_ string, retErr error) {
 	ing, err := mcfg.NewIngester(mcfg.IngestKeyFunc(), nil)
 	if err != nil {
 		return "", fmt.Errorf("ingester: %w", err)
 	}
 	defer func() { retErr = errors.Join(retErr, ing.Close()) }()
 
-	src, err := fetch.OpenTarStream(path)
+	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("re-open artifact for upload: %w", err)
+		return "", err
 	}
-	defer func() { retErr = errors.Join(retErr, src.Close()) }()
+	src, _, err := tarstream.SourceAt(file, info.Size(), "")
+	if err != nil {
+		return "", fmt.Errorf("read artifact for upload: %w", err)
+	}
+	if closer, ok := src.(io.Closer); ok {
+		defer func() { retErr = errors.Join(retErr, closer.Close()) }()
+	}
+	if _, ok := src.(tarstream.Digester); !ok {
+		return "", errors.New("artifact lacks a carrier digest")
+	}
 
 	res, err := ing.Ingest(ctx, src, ingest.IngestOption{
 		OnProgress: byteProgress(!noProgress, "erofs"),

@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
@@ -69,31 +67,17 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 			return fmt.Errorf("create artifact: %w", err)
 		}
 	}
-	var pending string
+	var pending *pendingArtifact
+	var excluded []string
 	if named || upload {
-		var f *os.File
 		var err error
-		if named {
-			f, err = createPendingOutput(output, ".flatten-artifact-")
-		} else {
-			f, err = os.CreateTemp(tmpDir, ".flatten-artifact-*")
-		}
+		pending, err = reserveArtifact(output, tmpDir)
 		if err != nil {
 			return fmt.Errorf("create artifact: %w", err)
 		}
-		pending = f.Name()
-		defer func() {
-			if err := os.Remove(pending); err != nil && !errors.Is(err, os.ErrNotExist) {
-				retErr = errors.Join(retErr, err)
-			}
-		}()
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
-	excluded := []string{pending}
-	if pending == "" {
-		excluded = nil
+		defer func() { retErr = errors.Join(retErr, pending.Close()) }()
+		// Exclude the entire private staging directory, including its file.
+		excluded = append(excluded, pending.path)
 	}
 	if named {
 		excluded = append(excluded, output)
@@ -109,8 +93,8 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 	}()
 	w := io.Writer(os.Stdout)
 	var owned io.WriteCloser
-	if pending != "" {
-		owned, err = ops.createArtifact(pending)
+	if pending != nil {
+		owned, err = ops.createArtifact(pending.file)
 		if err != nil {
 			return fmt.Errorf("create artifact: %w", err)
 		}
@@ -133,20 +117,24 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 	}
 	// All source descriptors and owned scratch are released before upload or
 	// a second read of P. A failure never exposes a named partial artifact.
-	if output == "-" && pending != "" {
-		f, err := os.Open(pending)
+	if pending != nil {
+		if err := pending.verify(); err != nil {
+			return err
+		}
+	}
+	if output == "-" && pending != nil {
+		info, err := pending.file.Stat()
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(os.Stdout, exportContextReader{ctx, f})
-		err = errors.Join(copyErr, f.Close())
+		_, err = io.Copy(os.Stdout, exportContextReader{ctx, io.NewSectionReader(pending.file, 0, info.Size())})
 		if err != nil {
 			return fmt.Errorf("write to stdout: %w", err)
 		}
 	}
 	var key string
 	if upload {
-		key, err = ops.ingestArtifact(ctx, pending, mcfg, noProgress)
+		key, err = ops.ingestArtifact(ctx, pending.file, mcfg, noProgress)
 		if err != nil {
 			return err
 		}
@@ -154,11 +142,16 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if named {
-		if _, _, err := outputPermissions(output); err != nil {
-			return fmt.Errorf("commit artifact: %w", err)
+	if pending != nil {
+		if err := pending.closeFile(); err != nil {
+			return fmt.Errorf("close artifact: %w", err)
 		}
-		if err := os.Rename(pending, output); err != nil {
+		if err := pending.verify(); err != nil {
+			return err
+		}
+	}
+	if named {
+		if err := pending.commit(); err != nil {
 			return fmt.Errorf("commit artifact: %w", err)
 		}
 	}
@@ -196,41 +189,4 @@ func outputPermissions(output string) (os.FileMode, *syscall.Stat_t, error) {
 		return 0, nil, fmt.Errorf("destination is not a regular file: %s", output)
 	}
 	return st.Mode().Perm(), st.Sys().(*syscall.Stat_t), nil
-}
-
-func createPendingOutput(output, prefix string) (*os.File, error) {
-	mode, previous, err := outputPermissions(output)
-	if err != nil {
-		return nil, err
-	}
-	for range 10 {
-		name := filepath.Join(filepath.Dir(output), prefix+rand.Text())
-		// A new output keeps normal 0666 & umask semantics. Existing output
-		// permissions are restored explicitly, unaffected by this process's umask.
-		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
-		if errors.Is(err, os.ErrExist) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if previous != nil {
-			info, statErr := f.Stat()
-			if statErr != nil {
-				return nil, errors.Join(statErr, f.Close(), os.Remove(name))
-			}
-			current := info.Sys().(*syscall.Stat_t)
-			if current.Uid != previous.Uid || current.Gid != previous.Gid {
-				if err = f.Chown(int(previous.Uid), int(previous.Gid)); err != nil {
-					return nil, errors.Join(err, f.Close(), os.Remove(name))
-				}
-			}
-			// Restore the mode after chown, which can clear permission bits.
-			if err = f.Chmod(mode); err != nil {
-				return nil, errors.Join(err, f.Close(), os.Remove(name))
-			}
-		}
-		return f, nil
-	}
-	return nil, fmt.Errorf("reserve pending output: %w", os.ErrExist)
 }
