@@ -21,6 +21,7 @@ cp "$original_dir/../../Makefile" "$fixture/Makefile"
 cp "$original_dir/../Makefile" "$fixture/native-deps/Makefile"
 cp "$original_dir/"{build-erofs.sh,common.sh,erofs-recipe.sh} "$fixture/native-deps/deps/"
 cp "$original_dir/"{test-erofs-sha256.sh,test-erofs-sha256.c} "$fixture/native-deps/deps/"
+cp "$original_dir/"{test-erofs-read.sh,test-erofs-read.py,test-erofs-read-wrap.c,test-erofs-plan.py} "$fixture/native-deps/deps/"
 cp -a "$original_dir/erofs-patches" "$fixture/native-deps/deps/"
 cp "$candidate_bin/"{mkfs.erofs,fsck.erofs,.erofs-recipe} "$fixture/native-deps/bin/$TARGET_ARCH/"
 cp "$archive" "$fixture/native-deps/build/tarball/source.tar.gz"
@@ -191,6 +192,30 @@ EROFS_BUILD_JOBS="$(( ${KUASAR_BUILD_JOBS:-2} < 2 ? ${KUASAR_BUILD_JOBS:-2} : 2 
 cp "$recipe_stamp" "$work/consumed-stamp"
 grep -Fq $'workspace\tinputs/consumed.h' "$recipe_stamp" || die 'consumed header missing from stamp'
 grep -Fq $'workspace\tinputs/libconsumed.a' "$recipe_stamp" || die 'consumed archive missing from stamp'
+
+# Restore the object/archive subset retained by the native cache. Their presence
+# alone must not authorize a relink without the configured build files. Use the
+# real private build above; never modify the production cache or its binaries.
+mv "$src_dir" "$work/relink-source"
+mkdir -p "$src_dir/lib/.libs" "$src_dir/mkfs"
+cp "$work/relink-source/lib/.libs/liberofs.a" "$src_dir/lib/.libs/"
+cp "$work/relink-source/mkfs/mkfs_erofs-main.o" "$src_dir/mkfs/"
+cached_before="$(sha256sum "$BINDIR/"{mkfs.erofs,fsck.erofs,.erofs-recipe} \
+    "$src_dir/lib/.libs/liberofs.a" "$src_dir/mkfs/mkfs_erofs-main.o")"
+bash "$script_dir/build-erofs.sh" > "$work/relink-cache-hit.log" 2>&1 \
+    || { cat "$work/relink-cache-hit.log"; die 'trimmed source cache was not reusable'; }
+grep -Fq 'already built with matching erofs recipe' "$work/relink-cache-hit.log"
+bash "$script_dir/test-erofs-read.sh" > "$work/cached-read.log" 2>&1 \
+    || { cat "$work/cached-read.log"; die 'read/Plan tests failed after native cache restoration'; }
+[ "$cached_before" = "$(sha256sum "$BINDIR/"{mkfs.erofs,fsck.erofs,.erofs-recipe} \
+    "$src_dir/lib/.libs/liberofs.a" "$src_dir/mkfs/mkfs_erofs-main.o")" ] \
+    || die 'read/Plan tests replaced cached outputs, recipe or relink materials'
+[ "$(find "$src_dir" -type f | wc -l)" -eq 2 ] \
+    || die 'read/Plan tests populated the production cache source tree'
+[ -z "$(find "$BUILD_DIR/tests" -mindepth 1 -maxdepth 1 -type d -name 'exact-read.*' -print -quit)" ] \
+    || die 'read/Plan tests retained a private rebuild directory'
+echo 'test-erofs-recipe: read/Plan tests after trimmed cache restore preserve outputs and clean private rebuild PASS'
+
 for input in consumed.h libconsumed.a; do
     cp "$fixture/inputs/$input" "$work/saved-input"
     case "$input" in
