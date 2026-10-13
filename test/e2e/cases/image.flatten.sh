@@ -147,6 +147,7 @@ payload.write_bytes(b"static empty-root streaming artifact\n" * 1024)
 os.chown(payload, 10001, 10002)
 os.chmod(payload, 0o640)
 env = os.environ.copy()
+env.pop("FLATTEN_CONFIG", None)  # Host configuration paths do not exist in this empty root.
 env["MKFS_EROFS_PATH"] = "/bin/mkfs.erofs"
 command = ["chroot", str(root), "/bin/flatten-ctl", "export", "--tmpdir", "/scratch",
            "--output", "-", "--no-progress", "/source"]
