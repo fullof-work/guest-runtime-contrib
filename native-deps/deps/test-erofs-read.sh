@@ -9,10 +9,15 @@ trap 'rm -rf "$work"' EXIT
 # A validated native cache can omit the compilation tree. Reconstruct it with
 # the same selected recipe in private test storage when relink inputs are absent.
 test_source="$BUILD_DIR/src/erofs-utils"
-if [ ! -f "$test_source/lib/.libs/liberofs.a" ] || [ ! -f "$test_source/mkfs/mkfs_erofs-main.o" ]; then
+# Relink materials in the cache include the object and archive, but omit the
+# configured Makefile, libtool and libtool archive needed to link the wrapper.
+for input in mkfs/Makefile libtool config.status config.h lib/liberofs.la \
+    lib/.libs/liberofs.a mkfs/mkfs_erofs-main.o; do
+    [ -f "$test_source/$input" ] && continue
     BUILD_DIR="$work/rebuild" BINDIR="$work/rebuild-bin" bash "$script_dir/build-erofs.sh"
     test_source="$work/rebuild/src/erofs-utils"
-fi
+    break
+done
 # Relink only this disposable copy, retaining production objects and binaries.
 cp -a "$test_source" "$work/src"
 read -r -a compiler <<< "${CC:-gcc}"
