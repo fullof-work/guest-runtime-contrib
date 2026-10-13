@@ -77,6 +77,8 @@ Progress and diagnostics go to stderr. Stdout carries requested results: the art
 
 `export` / `cache gc` accept `--no-progress`. Streaming export reports preparation stages as `flatten: ...`; upload reports `upload: ...` with percentage and rate. The complete-download `remote.Pull` API retains its separate layer-count progress callback. Byte-progress updates are throttled to two seconds.
 
+Directory export excludes regular files attached to stdout or stderr, including aliases inside the source, before planning or writing progress. The open file identity is used; procfs path resolution is unnecessary. Pipes remain streamed directly. Explicit output paths, scratch and these redirected files share the same selection for planning, reads and final validation.
+
 ### 2.1 `flatten-ctl export`
 
 ```text

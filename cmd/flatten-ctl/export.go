@@ -15,6 +15,13 @@ import (
 
 func prepareDirExport(ctx context.Context, root, tmpDir string, skips []string, skipMounts bool, runtimeConfig string, noProgress bool, excluded []string) (*flatten.PreparedImage, error) {
 	dopts := flatten.DirOptions{Skip: skips, SkipMounts: skipMounts, OutputPaths: excluded}
+	// The shell may create redirected output inside the selected source before
+	// invocation. Exclude those inodes before progress or artifact writes start.
+	for _, file := range []*os.File{os.Stdout, os.Stderr} {
+		if info, err := file.Stat(); err == nil && info.Mode().IsRegular() {
+			dopts.OutputFiles = append(dopts.OutputFiles, file)
+		}
+	}
 	if !noProgress {
 		dopts.Warnf = func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	}

@@ -107,6 +107,8 @@ manifest key,而 `--upload --print-digest` 会输出多个值。捕获 key 时�
 流式导出按准备阶段打印 `flatten: ...`，上传打印 `upload: ...`（百分比和速率）；
 字节型进度按 2 秒节流。完整下载入口 `remote.Pull` 仍保留独立的层计数进度回调。
 
+目录导出在规划或写入进度之前，按打开文件的身份排除 stdout、stderr 对应的普通文件及源内别名，无需通过 procfs 解析路径；管道仍直接流式输出。显式输出路径、scratch 和这些重定向文件共用规划、读取及最终校验的同一选集。
+
 ### 2.1 `flatten-ctl export`
 
 ```

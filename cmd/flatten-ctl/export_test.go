@@ -1011,3 +1011,99 @@ func TestUploadCompletionCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestExportRedirectedDirectoryStreams(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr", "both"} {
+		for _, location := range []string{"inside", "hardlink", "renamed"} {
+			t.Run(stream+"/"+location, func(t *testing.T) {
+				f := newExportFixture(t)
+				want := expectedExportArtifact(t, f)
+				sourceAlias := filepath.Join(f.root, "source-alias")
+				if err := os.Symlink(f.source, sourceAlias); err != nil {
+					t.Fatal(err)
+				}
+				redirected := func(name string) *os.File {
+					t.Helper()
+					path := filepath.Join(f.source, name)
+					if location != "inside" {
+						path = filepath.Join(f.root, name)
+					}
+					file, err := os.Create(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { file.Close() })
+					if location == "hardlink" {
+						for _, alias := range []string{name, name + "-alias"} {
+							if err := os.Link(path, filepath.Join(f.source, alias)); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					if location == "renamed" {
+						if err := os.Rename(path, filepath.Join(f.source, name)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return file
+				}
+				exe, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				output := f.output
+				var artifact, diagnostics *os.File
+				if stream == "stdout" || stream == "both" {
+					artifact = redirected("artifact.img")
+					output = "-"
+				}
+				if stream == "stderr" || stream == "both" {
+					diagnostics = redirected("export.log")
+				}
+				cmd := exec.Command(exe, "-test.run=^TestExportProcess$", "--", "--export-helper", "", f.root,
+					"--tmpdir", f.scratch, "--config", f.config, "--output", output, sourceAlias)
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + f.scratch, "MKFS_EROFS_PATH=" + f.mkfs, "GOMAXPROCS=2"}
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if artifact != nil {
+					cmd.Stdout = artifact
+				}
+				if diagnostics != nil {
+					cmd.Stderr = diagnostics
+				}
+				err = cmd.Run()
+				if diagnostics != nil {
+					if _, seekErr := diagnostics.Seek(0, io.SeekStart); seekErr != nil {
+						t.Fatal(seekErr)
+					}
+					body, readErr := io.ReadAll(diagnostics)
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					stderr.Write(body)
+				}
+				if err != nil {
+					t.Fatalf("export: %v: %s", err, stderr.String())
+				}
+				if !strings.Contains(stderr.String(), "flatten: build-erofs") {
+					t.Fatal("progress did not exercise redirected diagnostics")
+				}
+				if artifact != nil {
+					if _, err := artifact.Seek(0, io.SeekStart); err != nil {
+						t.Fatal(err)
+					}
+					got, err := io.ReadAll(artifact)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("redirected artifact differs: got %d want %d", len(got), len(want))
+					}
+				} else {
+					assertExportFile(t, output, want)
+				}
+				assertExportScratch(t, f.scratch, nil)
+			})
+		}
+	}
+}
