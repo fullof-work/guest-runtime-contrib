@@ -173,7 +173,9 @@ Scratch uses `--tmpdir`, configuration `tmpdir`, then `$TMPDIR` or `/tmp`.
 | Explicit persistent cache | Verified completed blobs survive export cleanup. Pending writes belong to their writer; cancellation joins prefetch before removing its pending files. GC is a separate bounded-cache operation (§2.4). |
 | Caller directory, input archive, unrelated files and scratch parent | Never removed by owned-resource cleanup. |
 
-New files use `0666` subject to the caller's umask; replacing an ordinary file preserves its permission bits. Named destinations must be regular files or absent: devices, FIFOs, directories and symlinks are rejected before preparation and checked again before commit.
+New files use `0666` subject to the caller's umask; replacing an ordinary file preserves its UID, GID and permission bits. Failure to preserve ownership leaves the previous file untouched. Named destinations must be regular files or absent: devices, FIFOs, directories and symlinks are rejected before preparation and checked again before commit.
+
+The first SIGINT/SIGTERM requests cancellation. If stdout remains blocked, a subsequent signal restores normal process termination; forced termination cannot run deferred cleanup.
 
 Cancellation closes owned input bodies, waits for layer application and native
 processes to stop, and only then removes scratch. Broken stdout pipes unwind the

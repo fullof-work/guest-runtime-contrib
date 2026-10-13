@@ -220,7 +220,16 @@ func runExport(args []string, ops exportIO) error {
 	defer signal.Stop(sigpipe)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	// A blocked stdout write cannot observe ctx. Restore normal signal
+	// handling after the first cancellation so another signal can terminate
+	// the process. Join this waiter on ordinary return as well.
+	signalsStopped := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		cancel()
+		close(signalsStopped)
+	}()
+	defer func() { cancel(); <-signalsStopped }()
 	var mcfg *manifest.Config
 	if *upload {
 		mcfg, err = loadManifestCfg(*manifestCfg)

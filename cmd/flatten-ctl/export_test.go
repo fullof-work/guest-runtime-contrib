@@ -14,6 +14,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 	"github.com/kuasar-sandbox/accelerator/pkg/image"
@@ -629,5 +632,158 @@ func TestExportRechecksDestinationBeforeCommit(t *testing.T) {
 	pending, err := filepath.Glob(filepath.Join(f.root, ".flatten-artifact-*"))
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending artifact remains: %v %v", pending, err)
+	}
+}
+
+func TestExportPreservesExistingOutputOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to exercise replacement of a foreign-owned output")
+	}
+	for _, upload := range []bool{false, true} {
+		t.Run(fmt.Sprintf("upload-%t", upload), func(t *testing.T) {
+			f := newExportFixture(t)
+			if err := os.Chown(f.output, 12345, 23456); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(f.output, 0640); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--no-progress", "--tmpdir", f.scratch, "--config", f.config, "--output", f.output}
+			mode := ""
+			if upload {
+				manifestConfig := filepath.Join(f.root, "empty-manifest.yaml")
+				writeExportFile(t, manifestConfig, []byte("{}\n"))
+				args = append(args, "--upload", "--manifest-config", manifestConfig)
+				mode = "upload-success"
+			}
+			_, stderr, code := f.run(t, mode, false, append(args, f.source)...)
+			if code != 0 {
+				t.Fatalf("export %d: %s", code, stderr)
+			}
+			info, err := os.Stat(f.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := info.Sys().(*syscall.Stat_t)
+			if owner.Uid != 12345 || owner.Gid != 23456 || info.Mode().Perm() != 0640 {
+				t.Fatalf("replaced output uid/gid/mode: %d/%d/%o", owner.Uid, owner.Gid, info.Mode().Perm())
+			}
+			assertExportFile(t, f.output, expectedExportArtifact(t, f))
+			assertExportScratch(t, f.scratch, nil)
+		})
+	}
+}
+
+func TestExportBlockedStdoutSignalEscalation(t *testing.T) {
+	for _, upload := range []bool{false, true} {
+		for _, escalate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("upload-%t/escalate-%t", upload, escalate), func(t *testing.T) {
+				f := newExportFixture(t)
+				// Distinct 4 KiB chunks keep this artifact larger than the pipe capacity.
+				payload := make([]byte, 1<<20)
+				for i := 0; i < len(payload); i += 4096 {
+					copy(payload[i:], fmt.Sprintf("%064d", i))
+				}
+				writeExportFile(t, filepath.Join(f.source, "large"), payload)
+				exe, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				args := []string{"-test.run=^TestExportProcess$", "--", "--export-helper", "", f.root,
+					"--no-progress", "--tmpdir", f.scratch, "--config", f.config, "--output", "-"}
+				if upload {
+					manifestConfig := filepath.Join(f.root, "empty-manifest.yaml")
+					writeExportFile(t, manifestConfig, []byte("{}\n"))
+					args = append(args, "--upload", "--manifest-config", manifestConfig)
+				}
+				cmd := exec.Command(exe, append(args, f.source)...)
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + f.scratch, "MKFS_EROFS_PATH=" + f.mkfs, "GOMAXPROCS=2"}
+				reader, writer, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reader.Close()
+				defer writer.Close()
+				capacity, err := unix.FcntlInt(writer.Fd(), unix.F_SETPIPE_SZ, 4096)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = writer, &stderr
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				writer.Close()
+				finished := make(chan error, 1)
+				go func() { finished <- cmd.Wait() }()
+				waited := false
+				defer func() {
+					if !waited {
+						cmd.Process.Kill()
+						<-finished
+					}
+				}()
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					available, err := unix.IoctlGetInt(int(reader.Fd()), unix.TIOCINQ)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if available > 0 && available <= capacity {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("export did not reach the stdout pipe")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				// Let the producer enter its next write with the pipe still unread.
+				// A blocked atomic write need not fill every remaining pipe byte.
+				time.Sleep(50 * time.Millisecond)
+				if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+					t.Fatal(err)
+				}
+				// The first signal cancels the context; it cannot finish a blocked write.
+				select {
+				case err := <-finished:
+					waited = true
+					t.Fatalf("first signal bypassed blocked-write cancellation: %v: %s", err, &stderr)
+				case <-time.After(100 * time.Millisecond):
+				}
+				if escalate {
+					if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					// A receiver that resumes allows ordinary cancellation and owned cleanup.
+					if _, err := io.Copy(io.Discard, reader); err != nil {
+						t.Fatal(err)
+					}
+				}
+				select {
+				case err := <-finished:
+					waited = true
+					if err == nil {
+						t.Fatal("cancelled export succeeded")
+					}
+				case <-time.After(5 * time.Second):
+					cmd.Process.Kill()
+					<-finished
+					waited = true
+					t.Fatal("export swallowed signal escalation")
+				}
+				status := cmd.ProcessState.Sys().(syscall.WaitStatus)
+				if escalate {
+					if !status.Signaled() || status.Signal() != syscall.SIGTERM {
+						t.Fatalf("exit %v: %s", status, &stderr)
+					}
+				} else {
+					if status.Signaled() || !strings.Contains(stderr.String(), "context canceled") {
+						t.Fatalf("exit %v: %s", status, &stderr)
+					}
+					assertExportScratch(t, f.scratch, nil)
+				}
+			})
+		}
 	}
 }
