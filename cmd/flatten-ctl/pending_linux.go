@@ -21,6 +21,7 @@ type pendingArtifact struct {
 	fileInfo, dirInfo  os.FileInfo
 	path, name, output string
 	ownedFile          bool
+	createdDir         *unix.Stat_t
 }
 
 func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
@@ -28,6 +29,7 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 	parent := tmpDir
 	mode := os.FileMode(0600)
 	var uid, gid int = -1, -1
+	var accessACL []byte
 	if named {
 		permissions, previous, err := outputPermissions(output)
 		if err != nil {
@@ -36,6 +38,10 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 		mode = permissions
 		if previous != nil {
 			uid, gid = int(previous.Uid), int(previous.Gid)
+			accessACL, err = readOutputAccessACL(output)
+			if err != nil {
+				return nil, err
+			}
 		}
 		parent = filepath.Dir(output)
 	}
@@ -62,6 +68,14 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 			return nil, err
 		}
 		p.name, p.path = name, filepath.Join(parent, name)
+		var created unix.Stat_t
+		if err := unix.Fstatat(fd, name, &created, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return nil, err
+		}
+		if created.Mode&unix.S_IFMT != unix.S_IFDIR || created.Uid != uint32(os.Geteuid()) || created.Mode&0077 != 0 {
+			return nil, errors.New("output staging directory is not private")
+		}
+		p.createdDir = &created
 		break
 	}
 	if p.name == "" {
@@ -83,17 +97,35 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 	if err != nil {
 		return nil, err
 	}
-	// mkdir applies the process umask too. Restore owner access through the
-	// retained descriptor, without changing the umask or following a name in
-	// the destination directory. Linux 6.1 needs the procfs descriptor path;
-	// ordinary umasks need neither this fallback nor fchmodat2.
+	if st.Dev != p.createdDir.Dev || st.Ino != p.createdDir.Ino {
+		return nil, errors.New("output staging directory was replaced")
+	}
+	// Keep inherited setgid while restoring owner access. A usable directory
+	// descriptor works on Linux 6.1 even in a privileged empty root without /proc.
 	if st.Mode&0700 != 0700 {
-		err = unix.Fchmodat(dirFD, "", 0700, unix.AT_EMPTY_PATH)
-		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) {
-			err = os.Chmod(fmt.Sprintf("/proc/self/fd/%d", dirFD), 0700)
+		mode := uint32(0700) | st.Mode&unix.S_ISGID
+		accessFD, openErr := unix.Openat(dirFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr == nil {
+			err = errors.Join(unix.Fchmod(accessFD, mode), unix.Close(accessFD))
+		} else {
+			err = unix.Fchmodat(dirFD, "", mode, unix.AT_EMPTY_PATH)
+			if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) {
+				fileMode := os.FileMode(0700)
+				if mode&unix.S_ISGID != 0 {
+					fileMode |= os.ModeSetgid
+				}
+				err = os.Chmod(fmt.Sprintf("/proc/self/fd/%d", dirFD), fileMode)
+			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("restore private staging directory permissions: %w", err)
+		}
+		var restored unix.Stat_t
+		if err := unix.Fstat(dirFD, &restored); err != nil {
+			return nil, err
+		}
+		if restored.Gid != st.Gid || restored.Mode&02777 != mode {
+			return nil, errors.New("staging directory lost its private permissions or inherited group")
 		}
 	}
 	fileFD, err := unix.Openat(dirFD, "image", unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode))
@@ -111,9 +143,20 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 				return nil, err
 			}
 		}
-		// chown may clear mode bits, so restore permissions afterwards.
+		// Drop an inherited ACL when the existing destination had none, then
+		// restore its rwx bits and access ACL after ownership changes.
+		if accessACL == nil {
+			if err := unix.Fremovexattr(fileFD, outputAccessACL); err != nil && !absentAccessACL(err) {
+				return nil, err
+			}
+		}
 		if err := p.file.Chmod(mode); err != nil {
 			return nil, err
+		}
+		if accessACL != nil {
+			if err := unix.Fsetxattr(fileFD, outputAccessACL, accessACL, 0); err != nil {
+				return nil, err
+			}
 		}
 	}
 	p.fileInfo, err = p.file.Stat()
@@ -187,15 +230,44 @@ func (p *pendingArtifact) Close() error {
 				err = errors.Join(err, removeErr)
 			}
 		}
-		if p.dirInfo != nil && sameArtifactAt(p.parent, p.name, p.dirInfo) {
-			err = errors.Join(err, unix.Unlinkat(int(p.parent.Fd()), p.name, unix.AT_REMOVEDIR))
-		}
 		err = errors.Join(err, p.dir.Close())
 		p.dir = nil
 	}
 	if p.parent != nil {
+		// An open failure (for example EMFILE) still owns the created inode.
+		// Compare its identity before unlinking; never remove a replacement.
+		if p.createdDir != nil {
+			var current unix.Stat_t
+			if statErr := unix.Fstatat(int(p.parent.Fd()), p.name, &current, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
+				if current.Dev == p.createdDir.Dev && current.Ino == p.createdDir.Ino && current.Mode&unix.S_IFMT == unix.S_IFDIR {
+					err = errors.Join(err, unix.Unlinkat(int(p.parent.Fd()), p.name, unix.AT_REMOVEDIR))
+				}
+			} else if !errors.Is(statErr, unix.ENOENT) {
+				err = errors.Join(err, statErr)
+			}
+		}
 		err = errors.Join(err, p.parent.Close())
 		p.parent = nil
 	}
 	return err
+}
+
+const outputAccessACL = "system.posix_acl_access"
+
+func absentAccessACL(err error) bool {
+	return errors.Is(err, unix.ENODATA) || errors.Is(err, unix.EOPNOTSUPP)
+}
+
+func readOutputAccessACL(path string) ([]byte, error) {
+	// Linux limits a single xattr value to 64 KiB. One bounded read avoids an
+	// allocation/retry loop if the caller changes the destination concurrently.
+	value := make([]byte, 64<<10)
+	n, err := unix.Lgetxattr(path, outputAccessACL, value)
+	if absentAccessACL(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read destination access ACL: %w", err)
+	}
+	return value[:n], nil
 }
