@@ -912,3 +912,102 @@ func TestPendingArtifactRejectsReplacedDirectory(t *testing.T) {
 		t.Fatalf("owned payload remains: %v %v", entries, err)
 	}
 }
+
+func TestUploadCompletionCleanup(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary UID required for actual cleanup permission failure")
+	}
+	for _, failure := range []string{"", "ingest", "key"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newExportFixture(t)
+			pendingRoot := t.TempDir()
+			stdout, err := os.CreateTemp(t.TempDir(), "stdout-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldOut, oldErr := os.Stdout, os.Stderr
+			os.Stdout, os.Stderr = stdout, stderr
+			defer func() {
+				os.Stdout, os.Stderr = oldOut, oldErr
+				stdout.Close()
+				stderr.Close()
+				os.Chmod(pendingRoot, 0700)
+			}()
+			if failure == "key" {
+				if err := stdout.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ingestErr := errors.New("fixture ingest failure")
+			ingested := false
+			err = writePreparedExport(context.Background(), "", true, pendingRoot, nil, true,
+				func(excluded []string) (*flatten.PreparedImage, error) {
+					return flatten.PrepareDir(context.Background(), f.source, flatten.Options{TmpDir: f.scratch}, flatten.DirOptions{OutputPaths: excluded})
+				}, exportIO{createArtifact: artifactWriter, ingestArtifact: func(_ context.Context, file *os.File, _ *manifest.Config, _ bool) (string, error) {
+					info, e := file.Stat()
+					if e != nil {
+						return "", e
+					}
+					got, e := io.ReadAll(io.NewSectionReader(file, 0, info.Size()))
+					if e != nil {
+						return "", e
+					}
+					if !bytes.Equal(got, expectedExportArtifact(t, f)) {
+						t.Fatal("uploader did not receive complete artifact")
+					}
+					ingested = true
+					if e := os.Chmod(pendingRoot, 0555); e != nil {
+						return "", e
+					}
+					if failure == "ingest" {
+						return "", ingestErr
+					}
+					return "accepted-key-fixture", nil
+				}})
+			os.Stdout, os.Stderr = oldOut, oldErr
+			stdout.Close()
+			stderr.Close()
+			key, e := os.ReadFile(stdout.Name())
+			if e != nil {
+				t.Fatal(e)
+			}
+			warning, e := os.ReadFile(stderr.Name())
+			if e != nil {
+				t.Fatal(e)
+			}
+			if !ingested {
+				t.Fatal("ingest callback was not reached")
+			}
+			if failure == "" {
+				if err != nil || string(key) != "accepted-key-fixture\n" || !strings.Contains(string(warning), "artifact committed; staging cleanup") {
+					t.Fatalf("completed upload: key=%q error=%v warning=%q", key, err, warning)
+				}
+			} else {
+				if !errors.Is(err, unix.EACCES) || len(key) != 0 || len(warning) != 0 {
+					t.Fatalf("incomplete upload: key=%q error=%v warning=%q", key, err, warning)
+				}
+				if failure == "ingest" && !errors.Is(err, ingestErr) {
+					t.Fatalf("lost primary error: %v", err)
+				}
+				if failure == "key" && !strings.Contains(err.Error(), "write manifest key") {
+					t.Fatalf("lost key failure: %v", err)
+				}
+			}
+			if err := os.Chmod(pendingRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(pendingRoot)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("expected retained empty stage: %v %v", entries, err)
+			}
+			if err := os.Remove(filepath.Join(pendingRoot, entries[0].Name())); err != nil {
+				t.Fatal(err)
+			}
+			assertExportScratch(t, f.scratch, nil)
+		})
+	}
+}

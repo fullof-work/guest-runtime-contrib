@@ -161,12 +161,13 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 		if _, err := fmt.Println(key); err != nil {
 			return fmt.Errorf("write manifest key: %w", err)
 		}
+		committed = true // Successful ingest and key output complete an upload.
 	}
 	return nil
 }
 
-// Rename commits a named destination. A later empty-stage cleanup failure
-// must be observable without misreporting the already committed file as failed.
+// Rename commits a named destination; successful key output completes an upload.
+// Later staging cleanup must not misreport either completed operation as failed.
 func finishArtifactOutput(pending *pendingArtifact, committed bool) error {
 	err := pending.Close()
 	if err != nil && committed {
