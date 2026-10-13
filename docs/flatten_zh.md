@@ -202,7 +202,7 @@ stdout 等 writer 输出现有工件，不保存整镜像压缩层、mkfs 私有
 | 私有 rootfs、Plan/layout 和 FD | 由 `PreparedImage` 持有到输出结束；Close 等待工作退出再释放。半应用失败使整个 rootfs 失效，重试从固定输入、新 scratch 开始。 |
 | Docker-save 输入 | 可 seek 文件原位建索引；不可 seek 输入只保留一份有界外层 spool，全部层校验后、规划前删除。不再单独解出内层 tar。 |
 | 最终工件 P | 仅 stdout 时直接流式输出；上传/复读保留一份必要 P，成功或失败后清理。 |
-| 命名 `--output` | 先写同目录 pending 文件；writer Close、最终校验、prepared 资源释放和请求的上传均成功后才原子改名。失败保留已有目标文件。 |
+| 命名 `--output` | 先写同目录 pending 文件；writer Close、最终校验、prepared 资源释放和请求的上传均成功后才原子改名。提交前失败保留已有目标文件；rename 后空暂存目录清理失败通过 stderr 告警，不将已提交文件判为失败。 |
 | 显式持久缓存 | 完成态 blob 不随任务删除。取消先等待预取退出，再删除本次 pending；GC 独立执行（§2.4）。 |
 | 调用者目录、输入归档、无关文件及 scratch 父目录 | 不由任务资源清理删除。 |
 
@@ -650,7 +650,10 @@ Plan/layout 身份。接收方必须同时要求完整工件身份/尾以及 pro
 才能 Ready 或写回转换结果；仅收到 payload 字节不表示成功。
 
 显式 `WriteRaw` 使用同一 Plan；正常 CLI 不生成 raw 暂存。命名 raw 和 artifact
-均使用 pending 文件原子提交。`Close` 取消并等待活动工作，然后释放拥有的资源；
+均使用 pending 文件原子提交。rename 是提交点，发生在输出/文件关闭、源校验及源资源
+清理成功之后。后续空暂存目录清理不能撤销提交：CLI 向 stderr 告警；raw 文件 API 在
+提供 `Options.CleanupWarning` 时同步调用它（nil 时静默），已提交文件仍返回成功。
+`Close` 取消并等待活动工作，然后释放拥有的资源；
 调用者提供的任意输出 writer 须自行让阻塞的 Write 返回。
 
 `make -C native-deps erofs` 构建维护中的 native 工具，`make build` 沿用现有 CLI 和

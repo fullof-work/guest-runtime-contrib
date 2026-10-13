@@ -67,6 +67,7 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 			return fmt.Errorf("create artifact: %w", err)
 		}
 	}
+	committed := false
 	var pending *pendingArtifact
 	var excluded []string
 	if named || upload {
@@ -75,7 +76,7 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 		if err != nil {
 			return fmt.Errorf("create artifact: %w", err)
 		}
-		defer func() { retErr = errors.Join(retErr, pending.Close()) }()
+		defer func() { retErr = errors.Join(retErr, finishArtifactOutput(pending, committed)) }()
 		// Exclude the entire private staging directory, including its file.
 		excluded = append(excluded, pending.path)
 	}
@@ -154,6 +155,7 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 		if err := pending.commit(); err != nil {
 			return fmt.Errorf("commit artifact: %w", err)
 		}
+		committed = true
 	}
 	if upload {
 		if _, err := fmt.Println(key); err != nil {
@@ -161,6 +163,17 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 		}
 	}
 	return nil
+}
+
+// Rename commits a named destination. A later empty-stage cleanup failure
+// must be observable without misreporting the already committed file as failed.
+func finishArtifactOutput(pending *pendingArtifact, committed bool) error {
+	err := pending.Close()
+	if err != nil && committed {
+		fmt.Fprintf(os.Stderr, "warning: artifact committed; staging cleanup: %v\n", err)
+		return nil
+	}
+	return err
 }
 
 type exportContextReader struct {

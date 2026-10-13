@@ -169,7 +169,7 @@ Scratch uses `--tmpdir`, configuration `tmpdir`, then `$TMPDIR` or `/tmp`.
 | Private rootfs and Plan/layout | Owned by `PreparedImage` until output ends. Close waits for active work and releases its files and FDs. A failed layer invalidates the entire private rootfs; a retry starts fresh from the pinned input. |
 | Docker-save input | A seekable file is indexed in place. Non-seekable input retains one bounded outer-archive spool, removed after all layers verify, before planning. Inner layer tars are not extracted separately. |
 | Final artifact P | Stdout-only export streams directly. Upload/re-read retains one necessary P; it is removed after completion or error. |
-| Named `--output` | Written to a sibling pending file. Writer close, source validation, prepared-resource cleanup and requested upload must succeed before atomic rename. Failure preserves an existing destination. |
+| Named `--output` | Written to a sibling pending file. Writer close, source validation, prepared-resource cleanup and requested upload must succeed before atomic rename. Pre-commit failure preserves an existing destination; after rename, empty-stage cleanup failure is a stderr warning and does not invalidate the committed file. |
 | Explicit persistent cache | Verified completed blobs survive export cleanup. Pending writes belong to their writer; cancellation joins prefetch before removing its pending files. GC is a separate bounded-cache operation (§2.4). |
 | Caller directory, input archive, unrelated files and scratch parent | Never removed by owned-resource cleanup. |
 
@@ -569,6 +569,10 @@ or conversion writeback. Observing payload bytes alone is insufficient.
 
 `WriteRaw` is an explicit API using the same plan. The normal CLI never generates
 raw staging. Named raw and artifact outputs use pending files and atomic commit.
+Rename is the commit point, after output/file-close, source validation and source
+resource cleanup succeed. Subsequent empty-stage cleanup cannot undo that commit:
+the CLI warns on stderr; raw file APIs synchronously call `Options.CleanupWarning`
+when supplied (nil stays silent), while returning success for the committed file.
 `Close` cancels active work, joins it and releases owned resources; an arbitrary
 caller-supplied output writer must itself return from a blocked Write.
 

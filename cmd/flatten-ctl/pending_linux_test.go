@@ -452,3 +452,79 @@ func TestArtifactPendingChownOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestArtifactPostCommitCleanup(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("ordinary UID required for actual permission failure")
+	}
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprint(committed), func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, "output")
+			if err := os.WriteFile(output, []byte("old"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			p, err := reserveArtifact(output, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = p.file.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err = p.closeFile(); err != nil {
+				t.Fatal(err)
+			}
+			if committed {
+				if err = p.commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = os.Chmod(dir, 0555); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(dir, 0700)
+
+			log, openErr := os.CreateTemp(t.TempDir(), "stderr-")
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			stderr := os.Stderr
+			os.Stderr = log
+			err = finishArtifactOutput(p, committed)
+			os.Stderr = stderr
+			if closeErr := log.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			diagnostic, readErr := os.ReadFile(log.Name())
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			warned := bytes.Contains(diagnostic, []byte("warning: artifact committed; staging cleanup:"))
+			if committed {
+				if err != nil || !warned {
+					t.Fatalf("committed: error=%v warning=%v", err, warned)
+				}
+			} else if !errors.Is(err, unix.EACCES) || warned {
+				t.Fatalf("uncommitted: error=%v warning=%v", err, warned)
+			}
+			want := "old"
+			if committed {
+				want = "new"
+			}
+			data, readErr := os.ReadFile(output)
+			if readErr != nil || string(data) != want {
+				t.Fatalf("output=%q err=%v want=%s", data, readErr, want)
+			}
+			// The nonfatal diagnostic still leaves observable, owned cleanup work.
+			if _, err := os.Stat(p.path); err != nil {
+				t.Fatalf("expected retained empty staging directory: %v", err)
+			}
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(p.path); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
