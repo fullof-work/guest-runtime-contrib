@@ -158,8 +158,11 @@ func writePreparedExport(ctx context.Context, output string, upload bool, tmpDir
 			return err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if named {
-		if err := pending.commit(); err != nil {
+		if err := pending.commit(ctx); err != nil {
 			return fmt.Errorf("commit artifact: %w", err)
 		}
 		committed = true

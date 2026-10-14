@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -80,11 +81,11 @@ func reserveArtifact(output, tmpDir string) (_ *pendingArtifact, retErr error) {
 		if err := unix.Fstatat(fd, name, &created, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return nil, err
 		}
-		// Retain the identity even when private-directory validation rejects it.
-		p.createdDir = &created
 		if created.Mode&unix.S_IFMT != unix.S_IFDIR || created.Uid != uint32(os.Geteuid()) || created.Mode&0077 != 0 {
 			return nil, errors.New("output staging directory is not private")
 		}
+		// Only a verified private inode qualifies for owned cleanup.
+		p.createdDir = &created
 		break
 	}
 	if p.name == "" {
@@ -308,7 +309,7 @@ func (p *pendingArtifact) verify() error {
 	return nil
 }
 
-func (p *pendingArtifact) commit() error {
+func (p *pendingArtifact) commit(ctx context.Context) error {
 	if err := p.verify(); err != nil {
 		return err
 	}
@@ -319,6 +320,10 @@ func (p *pendingArtifact) commit() error {
 	}
 	if err == nil && current.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("destination is not a regular file: %s", p.output)
+	}
+	// Verification may block; observe cancellation before starting the commit.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return unix.Renameat(int(p.dir.Fd()), "image", int(p.parent.Fd()), p.output)
 }

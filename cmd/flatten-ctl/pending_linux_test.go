@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -64,7 +65,7 @@ func TestArtifactPendingRestrictiveUmask(t *testing.T) {
 			if err := pending.closeFile(); err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.commit(); err != nil {
+			if err := pending.commit(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			if err := pending.Close(); err != nil {
@@ -141,7 +142,7 @@ func TestArtifactPendingAccessACL(t *testing.T) {
 			if err := pending.closeFile(); err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.commit(); err != nil {
+			if err := pending.commit(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			got := make([]byte, 64)
@@ -172,7 +173,7 @@ func TestArtifactPendingAccessACL(t *testing.T) {
 		if err := pending.closeFile(); err != nil {
 			t.Fatal(err)
 		}
-		if err := pending.commit(); err != nil {
+		if err := pending.commit(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := unix.Lgetxattr(output, "system.posix_acl_access", make([]byte, 64)); !errors.Is(err, unix.ENODATA) {
@@ -326,7 +327,7 @@ func TestArtifactPendingGroupAndEmptyRoot(t *testing.T) {
 		if err := pending.closeFile(); err != nil {
 			t.Fatal(err)
 		}
-		if err := pending.commit(); err != nil {
+		if err := pending.commit(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if err := pending.Close(); err != nil {
@@ -413,7 +414,7 @@ func TestArtifactPendingChownOnly(t *testing.T) {
 		if err := pending.closeFile(); err != nil {
 			t.Fatal(err)
 		}
-		if err := pending.commit(); err != nil {
+		if err := pending.commit(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if err := pending.Close(); err != nil {
@@ -475,7 +476,7 @@ func TestArtifactPostCommitCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			if committed {
-				if err = p.commit(); err != nil {
+				if err = p.commit(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -577,7 +578,7 @@ func TestArtifactPendingForeignGroup(t *testing.T) {
 			if err := pending.closeFile(); err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.commit(); err != nil {
+			if err := pending.commit(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			if err := pending.Close(); err != nil {
@@ -679,7 +680,7 @@ func TestArtifactPendingStickyReplacement(t *testing.T) {
 				if closeErr := pending.closeFile(); closeErr != nil {
 					t.Fatal(closeErr)
 				}
-				commitErr := pending.commit()
+				commitErr := pending.commit(context.Background())
 				pending.Close()
 				t.Fatalf("sticky replacement was not rejected before preparation; commit error: %v", commitErr)
 			}
@@ -700,7 +701,7 @@ func TestArtifactPendingStickyReplacement(t *testing.T) {
 			if err := pending.closeFile(); err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.commit(); err != nil {
+			if err := pending.commit(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			if err := pending.Close(); err != nil {

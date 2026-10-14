@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -65,7 +66,7 @@ func TestMountedArtifactOutputDestination(t *testing.T) {
 			pending, err := reserveArtifact(output, root)
 			if fileMount {
 				if err == nil {
-					commitErr := pending.commit()
+					commitErr := pending.commit(context.Background())
 					pending.Close()
 					t.Fatalf("mounted file was accepted before preparation; commit error: %v", commitErr)
 				}
@@ -91,7 +92,7 @@ func TestMountedArtifactOutputDestination(t *testing.T) {
 				if err := pending.closeFile(); err != nil {
 					t.Fatal(err)
 				}
-				if err := pending.commit(); err != nil {
+				if err := pending.commit(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				if err := pending.Close(); err != nil {

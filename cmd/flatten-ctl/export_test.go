@@ -899,7 +899,7 @@ func TestPendingArtifactRejectsReplacedDirectory(t *testing.T) {
 	}
 	sentinel := filepath.Join(p.path, "image")
 	writeExportFile(t, sentinel, []byte("replacement directory"))
-	if err := p.commit(); err == nil {
+	if err := p.commit(context.Background()); err == nil {
 		t.Fatal("replaced directory committed")
 	}
 	if err := p.Close(); err != nil {
