@@ -12,7 +12,7 @@ Guest-runtime 产品 E2E 统一由平台提供的 prepared-workspace runner 执�
 
 当前用例：
 
-- `image.flatten.sh`：从 OCI 镜像配置/属主到真实 flatten/EROFS 输出的正确性。
+- `image.flatten.sh`：空根内静态 CLI/原生工具、真实管道输出及消费者内容/元数据检查；从 OCI 镜像配置/属主到真实 flatten/EROFS 输出的正确性。
 - `image.registry.sh`：真实 registry、OCI 1.1 Referrers、Store、owner/key 隔离、过期与认证契约。
 
 ## 运行与前置条件
@@ -32,7 +32,7 @@ WORK=/tmp/kuasar-e2e
 
 产品用例只消费 prepared `BIN`、`E2E_WORKSPACE`、`E2E_LIB`、prepared fixture 和 prepared test helper。执行阶段不编译产品或 helper、不查找相邻源码仓库、不自动拉取兜底工作负载镜像，也不回退到源码路径。
 
-已选择的用例要求 Linux、root、Python 3、curl、可用 Docker daemon、GNU timeout、`mkfs.erofs`、支持 `--extract` 的 `fsck.erofs`、`flatten-ctl`、`store-ctl` 和 prepared zot helper。缺少或不可用的前置条件会使已选择用例失败，不能以成功 skip 代替。架构和宿主机能力属于执行条件，不是 suite。
+已选择的用例要求 Linux、root、Python 3、curl、可用 Docker daemon、GNU timeout、`chroot`、`cmp`、`mkfs.erofs`、支持 `--extract` 的 `fsck.erofs`、`flatten-ctl`、`store-ctl` 和 prepared zot helper。缺少或不可用的前置条件会使已选择用例失败，不能以成功 skip 代替。架构和宿主机能力属于执行条件，不是 suite。
 
 Source/helper 回归保留在产品 E2E 之外，可通过以下命令运行：
 

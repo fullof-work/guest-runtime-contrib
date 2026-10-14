@@ -44,8 +44,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
-	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/guest-runtime/internal/util"
 )
@@ -113,8 +111,8 @@ func cmdExport(args []string) {
 // exportIO holds the artifact writer and uploader for one export invocation.
 // Nil functions select the normal file and manifest implementations.
 type exportIO struct {
-	createArtifact func(string) (io.WriteCloser, error)
-	ingestArtifact func(string, *manifest.Config, bool) (string, error)
+	createArtifact func(*os.File) (io.WriteCloser, error)
+	ingestArtifact func(context.Context, *os.File, *manifest.Config, bool) (string, error)
 }
 
 // runExport owns scratch files. Return errors through this scope so cleanup
@@ -122,7 +120,7 @@ type exportIO struct {
 // happens before any resources are acquired.
 func runExport(args []string, ops exportIO) error {
 	if ops.createArtifact == nil {
-		ops.createArtifact = func(path string) (io.WriteCloser, error) { return os.Create(path) }
+		ops.createArtifact = artifactWriter
 	}
 	if ops.ingestArtifact == nil {
 		ops.ingestArtifact = ingestEROFS
@@ -143,7 +141,11 @@ func runExport(args []string, ops exportIO) error {
 	runtimeConfig := fs.String("runtime-config", "", "rootfs-dir source: runtime config JSON to append (OCI image config or a projected config.json)")
 	tmpDir := fs.String("tmpdir", "", "scratch directory (overrides the config tmpdir; created if missing)")
 	insecure := fs.Bool("insecure", false, "registry source: allow plain HTTP (TLS verification is controlled by config tls.*)")
+	expectConversion := fs.String("conversion-semantics", "", "require this generator's conversion policy (for build integration)")
 	fs.Parse(args)
+	if err := checkConversionSemantics(*expectConversion); err != nil {
+		return err
+	}
 	input := fs.Arg(0)
 	if input == "" {
 		input = "-" // default: docker-archive stream on stdin
@@ -199,7 +201,7 @@ func runExport(args []string, ops exportIO) error {
 	}
 
 	// Preserving the source image's file ownership needs root/CAP_CHOWN
-	// (applyOwnerMode); check it up front so an unprivileged run fails fast
+	// (the layer applier); check it up front so an unprivileged run fails fast
 	// here instead of partway through the first layer's chown — after a
 	// potentially expensive pull + extract. A rootfs-directory source never
 	// chowns (mkfs.erofs records the source inodes' ownership as read), so
@@ -218,180 +220,43 @@ func runExport(args []string, ops exportIO) error {
 	signal.Notify(sigpipe, syscall.SIGPIPE)
 	defer signal.Stop(sigpipe)
 
-	// The raw erofs always lands in a scratch file first (mkfs.erofs
-	// needs a seekable output), then gets packed into the tarstream
-	// artifact (entry "image") — the platform container for images —
-	// whether the destination is a file or stdout.
-	rawTmp, err := os.CreateTemp(cfg.TmpDir, "flatten-erofs-*.img")
-	if err != nil {
-		return fmt.Errorf("create temp output: %w", err)
-	}
-	rawPath := rawTmp.Name()
-	defer func() {
-		if rawPath != "" {
-			os.Remove(rawPath)
-		}
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// A blocked stdout write cannot observe ctx. Restore normal signal
+	// handling after the first cancellation so another signal can terminate
+	// the process. Join this waiter on ordinary return as well.
+	signalsStopped := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		cancel()
+		close(signalsStopped)
 	}()
-	if err := rawTmp.Close(); err != nil {
-		return fmt.Errorf("close temp output: %w", err)
-	}
-
-	switch {
-	case dirSrc:
-		if err := runDirFlatten(input, rawPath, cfg.TmpDir, skips, *skipMounts, *runtimeConfig, *noProgress); err != nil {
-			return err
-		}
-	case remoteSrc:
-		if err := runRemoteFlatten(input, rawPath, cfg, *printDigest, *noProgress); err != nil {
-			return err
-		}
-	default:
-		if err := runFlatten(input, rawPath, cfg.TmpDir, *noProgress); err != nil {
+	defer func() { cancel(); <-signalsStopped }()
+	var mcfg *manifest.Config
+	if *upload {
+		mcfg, err = loadManifestCfg(*manifestCfg)
+		if err != nil {
 			return err
 		}
 	}
-
-	if !*noProgress {
-		if info, err := os.Stat(rawPath); err == nil {
-			fmt.Fprintf(os.Stderr, "EROFS image: %s\n", formatSize(info.Size()))
-		}
-	}
-
-	// Pack the artifact. --output - streams it; --upload without
-	// --output packs to a scratch artifact for ingest.
-	artifactPath := *output
-	switch *output {
-	case "-":
-		if st, err := os.Stdout.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
-			return fmt.Errorf("export: refusing to write an image artifact to a terminal (use --output FILE or redirect stdout)")
-		}
-		artifactPath = ""
-		if *upload { // need a file for ingest too: pack once, copy to stdout
-			af, err := os.CreateTemp(cfg.TmpDir, "flatten-image-*.img")
+	prepare := func(excluded []string) (*flatten.PreparedImage, error) {
+		switch {
+		case dirSrc:
+			return prepareDirExport(ctx, input, cfg.TmpDir, skips, *skipMounts, *runtimeConfig, *noProgress, excluded)
+		case remoteSrc:
+			return prepareRemoteExport(ctx, input, cfg, *printDigest, *noProgress)
+		default:
+			opts := flatten.Options{TmpDir: cfg.TmpDir, Progress: flattenProgress(!*noProgress)}
+			if input == "-" {
+				return flatten.PrepareArchive(ctx, os.Stdin, opts)
+			}
+			f, err := os.Open(strings.TrimPrefix(input, "docker-archive:"))
 			if err != nil {
-				return fmt.Errorf("create temp artifact: %w", err)
+				return nil, err
 			}
-			artifactPath = af.Name()
-			defer os.Remove(artifactPath)
-			if err := af.Close(); err != nil {
-				return fmt.Errorf("close temp artifact: %w", err)
-			}
-		}
-		if artifactPath == "" {
-			if err := packImageArtifact(rawPath, os.Stdout); err != nil {
-				return err
-			}
-		}
-	case "":
-		af, err := os.CreateTemp(cfg.TmpDir, "flatten-image-*.img")
-		if err != nil {
-			return fmt.Errorf("create temp artifact: %w", err)
-		}
-		artifactPath = af.Name()
-		defer os.Remove(artifactPath)
-		if err := af.Close(); err != nil {
-			return fmt.Errorf("close temp artifact: %w", err)
+			return flatten.PrepareArchive(ctx, f, opts)
 		}
 	}
-	if artifactPath != "" {
-		af, err := ops.createArtifact(artifactPath)
-		if err != nil {
-			return fmt.Errorf("create artifact: %w", err)
-		}
-		if err := packImageArtifact(rawPath, af); err != nil {
-			af.Close()
-			return err
-		}
-		if err := af.Close(); err != nil {
-			return fmt.Errorf("close artifact: %w", err)
-		}
-	}
-
-	// Packing has closed the raw source and the artifact writer. Free the raw
-	// image before copying the artifact to stdout or starting a long upload.
-	if err := os.Remove(rawPath); err != nil {
-		return fmt.Errorf("remove temp output: %w", err)
-	}
-	rawPath = "" // the deferred cleanup must not remove a later file at this path
-
-	if *output == "-" && artifactPath != "" {
-		f, err := os.Open(artifactPath)
-		if err != nil {
-			return fmt.Errorf("re-open artifact: %w", err)
-		}
-		_, copyErr := io.Copy(os.Stdout, f)
-		closeErr := f.Close()
-		if copyErr != nil {
-			return fmt.Errorf("write to stdout: %w", copyErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close artifact: %w", closeErr)
-		}
-	}
-
-	if !*upload {
-		return nil
-	}
-
-	mcfg, err := loadManifestCfg(*manifestCfg)
-	if err != nil {
-		return err
-	}
-	key, err := ops.ingestArtifact(artifactPath, mcfg, *noProgress)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Println(key); err != nil {
-		return fmt.Errorf("write manifest key: %w", err)
-	}
-	return nil
-}
-
-// packImageArtifact wraps the raw erofs(+config ZIP) at rawPath as a
-// tarstream artifact (payload "image" + digest marker) on w: the platform
-// container for images. Holes come from the filesystem (the raw file
-// is the live scratch source); the artifact itself is dense and
-// self-describing.
-func packImageArtifact(rawPath string, w io.Writer) (retErr error) {
-	f, err := os.Open(rawPath)
-	if err != nil {
-		return fmt.Errorf("open erofs: %w", err)
-	}
-	defer func() {
-		if err := f.Close(); retErr == nil && err != nil {
-			retErr = fmt.Errorf("close erofs: %w", err)
-		}
-	}()
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	holes, err := sparse.ProbeHoles(f)
-	if err != nil {
-		return fmt.Errorf("probe holes: %w", err)
-	}
-	src, err := sparse.NewSource(f, uint64(st.Size()), holes)
-	if err != nil {
-		return err
-	}
-	tail, boundary, err := tailzip.Read(f, st.Size(), tailzip.Options{})
-	if err != nil && !errors.Is(err, tailzip.ErrNotFound) {
-		return fmt.Errorf("image tail: %w", err)
-	}
-	if err == nil {
-		payload, err := tailzip.Prefix(src, uint64(boundary.Offset))
-		if err != nil {
-			return err
-		}
-		src, err = tailzip.Append(payload, tail, tailzip.Options{})
-		if err != nil {
-			return err
-		}
-	}
-	if _, _, err := tarstream.WriteTo(context.Background(), w, "image", src); err != nil {
-		return fmt.Errorf("pack image artifact: %w", err)
-	}
-	return nil
+	return writePreparedExport(ctx, *output, *upload, cfg.TmpDir, mcfg, *noProgress, prepare, ops)
 }
 
 // stringList is a repeatable string flag.
@@ -399,39 +264,6 @@ type stringList []string
 
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
-
-// runDirFlatten exports an already-flattened rootfs directory
-// (flatten.BuildFromDir): mkfs.erofs reads the tree in place — no
-// staging copy, no source mutation.
-func runDirFlatten(root, outputPath, tmpDir string, skips []string, skipMounts bool, runtimeConfig string, noProgress bool) error {
-	dopts := flatten.DirOptions{
-		Skip:       skips,
-		SkipMounts: skipMounts,
-	}
-	if !noProgress {
-		dopts.Warnf = func(format string, a ...any) {
-			fmt.Fprintf(os.Stderr, format+"\n", a...)
-		}
-	}
-	if runtimeConfig != "" {
-		data, err := os.ReadFile(runtimeConfig)
-		if err != nil {
-			return fmt.Errorf("--runtime-config: %w", err)
-		}
-		dopts.ConfigJSON = data
-	}
-	opts := flatten.Options{TmpDir: tmpDir, Progress: flattenProgress(!noProgress)}
-	return flatten.BuildFromDir(root, outputPath, opts, dopts)
-}
-
-func runFlatten(image, outputPath, tmpDir string, noProgress bool) error {
-	opts := flatten.Options{TmpDir: tmpDir, Progress: flattenProgress(!noProgress)}
-	if image == "-" {
-		return flatten.FlattenWith(os.Stdin, outputPath, opts)
-	}
-	image = strings.TrimPrefix(image, "docker-archive:")
-	return flatten.FlattenFileWith(image, outputPath, opts)
-}
 
 // isRemoteSource decides whether the export positional arg names a
 // remote registry reference (vs a local docker-archive). Precedence: --archive
@@ -455,58 +287,31 @@ func isRemoteSource(input string, forceRegistry, forceArchive bool) bool {
 	return remote.LooksLikeReference(input)
 }
 
-// runRemoteFlatten resolves a registry reference (pinning the platform-selected
-// digest), pulls its blobs through the shared OCI-layout cache, and flattens
-// them into outputPath via the same deterministic sink the docker-archive path
-// uses. The resolved repo@sha256 is logged to stderr (unless --no-progress) and
-// echoed to stdout when --print-digest is set.
-func runRemoteFlatten(ref, outputPath string, cfg *remote.Config, printDigest, noProgress bool) error {
-	ctx := context.Background()
-	res, err := cfg.Resolve(ctx, ref)
-	if err != nil {
-		return err
-	}
-	if !noProgress {
-		fmt.Fprintf(os.Stderr, "resolved: %s\n", res.Digest)
-	}
-	if printDigest {
-		if _, err := fmt.Println(res.Digest.String()); err != nil {
-			return fmt.Errorf("write source digest: %w", err)
-		}
-	}
-	cache, cleanup, err := cfg.OpenCache()
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	cfg.OnPullProgress = pullProgress(!noProgress)
-	src, err := cfg.Pull(ctx, res, cache)
-	if err != nil {
-		return err
-	}
-	opts := flatten.Options{TmpDir: cfg.TmpDir, Progress: flattenProgress(!noProgress)}
-	if err := flatten.Build(src, outputPath, opts); err != nil {
-		return err
-	}
-	return cache.MaybeEvict()
-}
-
-// ingestEROFS uploads the EROFS at path into the content store via the
+// ingestEROFS uploads the reserved artifact into the content store via the
 // manifest ingester and returns the hex manifest key.
-func ingestEROFS(path string, mcfg *manifest.Config, noProgress bool) (string, error) {
+func ingestEROFS(ctx context.Context, file *os.File, mcfg *manifest.Config, noProgress bool) (_ string, retErr error) {
 	ing, err := mcfg.NewIngester(mcfg.IngestKeyFunc(), nil)
 	if err != nil {
 		return "", fmt.Errorf("ingester: %w", err)
 	}
-	defer ing.Close()
+	defer func() { retErr = errors.Join(retErr, ing.Close()) }()
 
-	src, err := fetch.OpenTarStream(path)
+	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("re-open artifact for upload: %w", err)
+		return "", err
 	}
-	defer src.Close()
+	src, _, err := tarstream.SourceAt(file, info.Size(), "")
+	if err != nil {
+		return "", fmt.Errorf("read artifact for upload: %w", err)
+	}
+	if closer, ok := src.(io.Closer); ok {
+		defer func() { retErr = errors.Join(retErr, closer.Close()) }()
+	}
+	if _, ok := src.(tarstream.Digester); !ok {
+		return "", errors.New("artifact lacks a carrier digest")
+	}
 
-	res, err := ing.Ingest(context.Background(), src, ingest.IngestOption{
+	res, err := ing.Ingest(ctx, src, ingest.IngestOption{
 		OnProgress: byteProgress(!noProgress, "erofs"),
 	})
 	if err != nil {
@@ -524,16 +329,18 @@ func ingestEROFS(path string, mcfg *manifest.Config, noProgress bool) (string, e
 // ---------------------------------------------------------------------------
 
 type refererLookupResult struct {
-	Supported  bool   `json:"supported"`
-	Subject    string `json:"subject"`
-	Hit        bool   `json:"hit"`
-	ManifestID string `json:"manifest_id,omitempty"`
+	ConversionSemantics string `json:"conversion_semantics"`
+	Supported           bool   `json:"supported"`
+	Subject             string `json:"subject"`
+	Hit                 bool   `json:"hit"`
+	ManifestID          string `json:"manifest_id,omitempty"`
 }
 
 type refererPutResult struct {
-	Subject    string `json:"subject"`
-	ManifestID string `json:"manifest_id"`
-	Written    bool   `json:"written"`
+	ConversionSemantics string `json:"conversion_semantics"`
+	Subject             string `json:"subject"`
+	ManifestID          string `json:"manifest_id"`
+	Written             bool   `json:"written"`
 }
 
 func cmdReferer(args []string) {
@@ -557,7 +364,11 @@ func cmdRefererLookup(args []string) {
 	owner := fs.String("owner", "", "precomputed owner annotation value")
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	insecure := fs.Bool("insecure", false, "allow plain HTTP (TLS verification is controlled by config tls.*)")
+	expectConversion := fs.String("conversion-semantics", "", "require this generator's conversion policy")
 	fs.Parse(args)
+	if err := checkConversionSemantics(*expectConversion); err != nil {
+		fatal("%v", err)
+	}
 	ref := fs.Arg(0)
 	if ref == "" || *owner == "" {
 		fatal("usage: flatten-ctl referer lookup --owner <owner> [--json] <registry-ref>")
@@ -582,10 +393,11 @@ func cmdRefererLookup(args []string) {
 		fatal("%v", err)
 	}
 	out := refererLookupResult{
-		Supported:  supported,
-		Subject:    res.Digest.String(),
-		Hit:        hit,
-		ManifestID: id,
+		ConversionSemantics: image.ConversionSemantics,
+		Supported:           supported,
+		Subject:             res.Digest.String(),
+		Hit:                 hit,
+		ManifestID:          id,
 	}
 	if *asJSON {
 		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
@@ -612,7 +424,11 @@ func cmdRefererPut(args []string) {
 	validity := fs.String("validity", "", "optional Go duration for referrer expiry")
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	insecure := fs.Bool("insecure", false, "allow plain HTTP (TLS verification is controlled by config tls.*)")
+	expectConversion := fs.String("conversion-semantics", "", "require this generator's conversion policy")
 	fs.Parse(args)
+	if err := checkConversionSemantics(*expectConversion); err != nil {
+		fatal("%v", err)
+	}
 	ref := fs.Arg(0)
 	if ref == "" || *owner == "" || *manifestID == "" {
 		fatal("usage: flatten-ctl referer put --owner <owner> --manifest-id <hex> <subject-ref>")
@@ -638,7 +454,7 @@ func cmdRefererPut(args []string) {
 	if err := cfg.PutReferrerByOwner(ctx, res, *manifestID, *owner); err != nil {
 		fatal("%v", err)
 	}
-	out := refererPutResult{Subject: res.Digest.String(), ManifestID: *manifestID, Written: true}
+	out := refererPutResult{ConversionSemantics: image.ConversionSemantics, Subject: res.Digest.String(), ManifestID: *manifestID, Written: true}
 	if *asJSON {
 		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
 			fatal("write json: %v", err)
@@ -646,6 +462,13 @@ func cmdRefererPut(args []string) {
 		return
 	}
 	fmt.Printf("written %s %s\n", out.Subject, out.ManifestID)
+}
+
+func checkConversionSemantics(want string) error {
+	if want != "" && want != image.ConversionSemantics {
+		return fmt.Errorf("conversion semantics %q required, generator provides %q", want, image.ConversionSemantics)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

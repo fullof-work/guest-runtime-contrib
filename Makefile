@@ -153,7 +153,7 @@ test-e2e-scripts:
 
 RUNTIME_VERSION ?= runtime-v0.1.0
 VMLINUX_VERSION ?= vmlinux-v0.1.0
-ACCELERATOR_VERSION ?= v0.1.3
+ACCELERATOR_VERSION ?= v0.1.7
 SANDBOXER_VERSION ?= v0.1.3
 
 release-runtime: sandbox-runtime
