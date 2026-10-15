@@ -10,13 +10,11 @@ done
 
 FLATTEN_CTL="${BIN:?BIN is required}/flatten-ctl"
 ZOT_BIN="${ZOT_BIN:?prepared ZOT_BIN is required}"
-MKFS_EROFS_PATH="$BIN/mkfs.erofs"
 FSCK_EROFS="${FSCK_EROFS:-fsck.erofs}"
-export MKFS_EROFS_PATH
 
 log preflight
 [ "$(uname -s)" = Linux ] || die "E2E requires Linux"
-for tool in python3 curl docker timeout readlink stat chroot cmp "$FLATTEN_CTL" "$ZOT_BIN" "$MKFS_EROFS_PATH" "$FSCK_EROFS"; do
+for tool in python3 curl docker timeout readlink stat chroot cmp "$FLATTEN_CTL" "$ZOT_BIN" "$FSCK_EROFS"; do
     have "$tool" || die "prerequisite not found: $tool"
 done
 require_root
@@ -27,7 +25,6 @@ run docker info >/dev/null 2>&1 || die "docker daemon is not usable"
 for tool in "$FLATTEN_CTL" "$ZOT_BIN"; do
     run "$tool" --help >"$WORK/preflight.log" 2>&1 || die "prerequisite is not runnable: $tool"
 done
-run "$MKFS_EROFS_PATH" --version >"$WORK/mkfs-version.log" 2>&1 || die "mkfs.erofs is not runnable: $MKFS_EROFS_PATH"
 FSCK_HELP="$($FSCK_EROFS --help 2>&1 || true)"
 grep -Fq -- '--extract' <<<"$FSCK_HELP" || die "fsck.erofs does not support --extract"
 
@@ -133,8 +130,8 @@ else
     FIXTURE_ARCH="$(fixture_arch "$E2E_IMAGE")"
 fi
 
-log "image.flatten: static tools in an empty root -> non-seekable artifact"
-capture empty-root python3 - "$WORK/empty-root" "$FLATTEN_CTL" "$MKFS_EROFS_PATH" <<'PY'
+log "image.flatten: single static executable in an empty root -> non-seekable artifact"
+capture empty-root python3 - "$WORK/empty-root" "$FLATTEN_CTL" <<'PY'
 import os, pathlib, shutil, subprocess, sys
 root = pathlib.Path(sys.argv[1])
 for name in ["bin", "dev", "source", "scratch"]:
@@ -148,7 +145,7 @@ os.chown(payload, 10001, 10002)
 os.chmod(payload, 0o640)
 env = os.environ.copy()
 env.pop("FLATTEN_CONFIG", None)  # Host configuration paths do not exist in this empty root.
-env["MKFS_EROFS_PATH"] = "/bin/mkfs.erofs"
+env["MKFS_EROFS_PATH"] = "/missing/native-generator"  # Stale configuration must not select a generator.
 command = ["chroot", str(root), "/bin/flatten-ctl", "export", "--tmpdir", "/scratch",
            "--output", "-", "--no-progress", "/source"]
 with (root / "artifact").open("wb") as output, subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as child:
@@ -168,6 +165,48 @@ cmp "$WORK/empty-root/source/payload" "$WORK/empty-root/extracted/payload" || di
 [ "$(stat -c '%u:%g:%a' "$WORK/empty-root/extracted/payload")" = "10001:10002:640" ] \
     || die "empty-root payload ownership/mode changed"
 ok "static empty-root export, actual pipe, consumer content/metadata and scratch cleanup"
+
+log "image.flatten: fixed artifact identity on each native architecture"
+capture generator-golden python3 - "$WORK/generator-golden" "$FLATTEN_CTL" <<'PY'
+import hashlib, os, pathlib, shutil, stat, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+source, scratch = root / "source", root / "scratch"
+source.mkdir(parents=True)
+scratch.mkdir()
+payload = bytes((i * 17 + i // 4096) % 251 for i in range((1 << 20) + 73))
+for name, body in {"data": payload, "duplicate": payload, "short": b"fixed tail\n", "empty-file": b""}.items():
+    (source / name).write_bytes(body)
+os.link(source / "data", source / "hardlink")
+os.symlink("data", source / "symlink")
+(source / "empty-directory").mkdir()
+os.mkfifo(source / "fifo")
+for path in [source, *source.iterdir()]:
+    os.lchown(path, 12345, 23456)
+    mode = path.lstat().st_mode
+    if not stat.S_ISLNK(mode):
+        path.chmod(0o751 if stat.S_ISDIR(mode) else 0o640)
+environment = os.environ.copy()
+environment.pop("FLATTEN_CONFIG", None)
+environment["MKFS_EROFS_PATH"] = "/missing/native-generator"
+command = [sys.argv[2], "export", "--tmpdir", str(scratch), "--output", "-", "--no-progress", str(source)]
+artifact = root / "image.artifact"
+with artifact.open("wb") as output, subprocess.Popen(command, stdout=subprocess.PIPE, env=environment) as child:
+    shutil.copyfileobj(child.stdout, output)
+    child.stdout.close()
+    if child.wait() != 0:
+        raise SystemExit("fixed generator export failed")
+with artifact.open("rb") as image:
+    actual = hashlib.file_digest(image, "sha256").hexdigest()
+# Shared with accelerator's TestGoPlannerCrossArchitectureGolden. The fixed
+# source excludes host architecture, ownership, umask and temporary paths.
+expected = "53497f42d28f1697238d70a3bdd227b740875308831a108cad52bd5009927f16"
+if actual != expected:
+    raise SystemExit(f"fixed artifact differs on {os.uname().machine}: {actual}; expected {expected}")
+assert not list(scratch.iterdir()), "fixed generator scratch survived"
+print(f"fixed artifact {actual} verified on {os.uname().machine}")
+PY
+capture generator-golden-info "$FLATTEN_CTL" info --json "$WORK/generator-golden/image.artifact"
+ok "native architecture matches the fixed Go generator artifact identity"
 
 log "image.flatten: real registry image -> EROFS"
 start_zot "$WORK/zot" ZOT_PORT

@@ -3,7 +3,7 @@
 <a id="native-deps"></a>
 # native-deps — build and maintenance
 
-The native-deps directory builds upstream sources into three default artifact families consumed at runtime, not linked by the Go repositories: `mkfs.erofs`/`fsck.erofs` (erofs-utils), `vmlinux` (guest kernel) and `envd` (E2B guest agent). Their autotools/Kbuild/Go toolchains and independent upstream schedules are kept together in `guest-runtime/native-deps`. An additional `versitygw` gateway target is opt-in and not part of the default build.
+The native-deps directory builds three default artifact families: `mkfs.erofs`/`fsck.erofs` (erofs-utils host packaging and independent test tools), `vmlinux` (guest kernel) and `envd` (E2B guest agent). Guest image export uses the Go EROFS library linked into `flatten-ctl` and does not execute these native tools. Their autotools/Kbuild/Go toolchains and independent upstream schedules are kept together in `guest-runtime/native-deps`. An additional `versitygw` gateway target is opt-in and not part of the default build.
 
 The common pipeline is: pinned upstream tarball URL with optional SHA256 verification → shared cache and extraction → local patches (vmlinux, using `git am`) → build → `bin/<arch>/`.
 
@@ -17,7 +17,7 @@ Project-level aggregation runs `make -C kuasar-sandbox build`, which invokes thi
 
 | Artifact | Pinned upstream | Repository inputs | Consumers |
 | --- | --- | --- | --- |
-| `mkfs.erofs` / `fsck.erofs` | erofs-utils v1.9.1 | — | accelerator flattening, guest-runtime image construction, source diagnostics and accelerator tests |
+| `mkfs.erofs` / `fsck.erofs` | erofs-utils v1.9.1 | — | host runtime-bundle construction, source diagnostics and independent accelerator comparison tests |
 | `vmlinux` | Linux 6.1.169 (LTS, cdn.kernel.org) | `deps/linux-patches/` and `deps/vmlinux/*.config` | sandboxer / sandbox-ctl guest kernel |
 | `envd` | e2b-dev/runtime 2026.22 source tarball | — | Guest agent in `sandbox-runtime.bundle` |
 | `versitygw` (opt-in) | versity/versitygw v1.5.0 | — | Local/single-node S3-compatible file-storage integration where required |
@@ -31,12 +31,13 @@ Calling `release.sh package` directly reuses prebuilt files; it does not rebuild
 native dependencies, replace source checkouts or reset caches. Runtime and
 Kernel remain independently built, packaged and selected.
 
-Runtime inputs are `bin/<arch>/{sandbox-runtime.bundle,flatten-ctl}` and
-`native-deps/bin/<arch>/mkfs.erofs`; Kernel uses
+Runtime package inputs are `bin/<arch>/{sandbox-runtime.bundle,flatten-ctl}`;
+the bundle is built earlier with a host `mkfs.erofs`, which is not a Runtime
+payload. Kernel uses
 `native-deps/bin/<arch>/vmlinux`. Existing `RELEASE_BIN_DIR` and
 `RELEASE_NATIVE_BIN_DIR` overrides select matching output directories.
 `RELEASE_SANDBOXER_SOURCE_DIR`, `RELEASE_ACCELERATOR_SOURCE_DIR`,
-`RELEASE_ENVD_SOURCE_DIR`, `RELEASE_EROFS_SOURCE_DIR` and
+`RELEASE_ENVD_SOURCE_DIR` and
 `RELEASE_LINUX_SOURCE_DIR` select the corresponding source trees;
 `RELEASE_SANDBOX_INIT_BIN` and `RELEASE_ENVD_BIN` select the matching init
 and Envd binaries for material collection and image consistency checks. Keep source versions, native link maps and these outputs
@@ -48,8 +49,9 @@ The Runtime source build uses `GOWORK=off` and the minimal
 Accelerator/Sandboxer dependency closure. Internal records use a release version
 only when its local Git tag identifies the selected commit, otherwise
 `git:<commit>`; future target tags need not exist. `flatten-ctl` must be the
-Linux/amd64 `github.com/kuasar-sandbox/guest-runtime/cmd/flatten-ctl` main
-package, with clean Go VCS metadata matching the selected project commit.
+Linux `github.com/kuasar-sandbox/guest-runtime/cmd/flatten-ctl` main package
+for the selected amd64 or arm64 target, with clean Go VCS metadata matching the
+selected project commit and a versioned, checksummed external go-erofs build record.
 The package records its requested Runtime or Kernel version separately from
 source commits.
 
@@ -70,13 +72,13 @@ Materials are isolated under `share/licenses/runtime` and
 carries `SOURCES.tsv`, `GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and
 `MATERIALS.sha256`. Collection rejects missing notices, unreadable subtrees,
 partial traversals and collisions between different inputs. Project, Envd,
-EROFS, Linux, internal/shared-module and system records must reference their
+Linux, Go dependency and internal/shared-module records must reference their
 own material directories. Kernel includes Linux `COPYING` and the complete
 `LICENSES` tree from its selected source; the recorded COPYING digest must
 agree with the bundled file.
 
 Validation accepts only the selected unit's payloads: Runtime has
-`sandbox-runtime.bundle`, `flatten-ctl` and `mkfs.erofs` under `bin/`;
+`sandbox-runtime.bundle` and `flatten-ctl` under `bin/`;
 Kernel has only `bin/vmlinux`. It checks exact paths, duplicate entries,
 types, root ownership, modes, inventory, source-record consistency and
 checksums. Foreign unit materials and unrelated directories are refused before
@@ -89,11 +91,19 @@ or compile readers on demand. These readers must support the image format,
 `fsck.erofs --extract` and `dump.erofs --path/--cat`.
 Validation checks the bundle's alignment and prefix digest, verifies the
 complete EROFS filesystem without extracting its tree, and reads only init,
-Envd, mkfs and flatten-ctl into fixed private files. In-image ownership/modes,
+Envd and flatten-ctl into fixed private files. In-image ownership/modes,
 Go main identities/targets and build records must match; init must also bind
-the selected Sandboxer commit. Embedded mkfs and flatten-ctl must equal their
-outer payloads. No archive executable is run. Kernel validation needs no EROFS
+the selected Sandboxer commit. Embedded flatten-ctl must equal its outer
+payload. An obsolete embedded or outer mkfs payload is rejected. No archive executable is run. Kernel validation needs no EROFS
 reader, Runtime payload or dependency checkout.
+
+#### Historical native-tool materials
+
+The following material contract applies to older Runtime packages that ship
+`mkfs.erofs`; use their matching release tools to validate them. Current
+Go-backed Runtime packages omit this native-tool inventory. The maintained
+erofs-utils recipe still retains pinned static dependencies and link maps for
+host packaging and independent native controls.
 
 The matching `mkfs.erofs` link map supplies every actual external archive and
 startup object to `EROFS-INPUTS.tsv`. The inventory retains their names and
@@ -130,6 +140,8 @@ source claims and notice copies without executing a catalog recipe.
 Ubuntu target dev packages continue through the installed Debian source-package
 and copyright path. There is no synthetic package registration, permissive
 fallback or additional written-offer commitment.
+
+#### Publishing and validation boundaries
 
 The publisher supplies the selected project `SOURCE_SHA` to validation before
 Tag/Release writes, uses the bundle's `release-notes.md` body and appends the
@@ -179,7 +191,7 @@ Native builds (host = target) create `bin/<name> → <arch>/<name>` for their pu
 ### 1.4 Idempotency and caching
 
 - **Artifact reuse:** Envd outputs are reused when their target files already exist. EROFS uses one `bin/<arch>/.erofs-recipe` v2 stamp for both output hashes, the verified archive bytes, root/native Makefiles, build/common/recipe helpers, the entire ordered patch directory, compiler/build tools, flags and pkg-config metadata. Compiler depfiles record actual external headers (including forced includes); both link maps record the selected archives and startup objects. Changed or missing inputs invalidate reuse and re-extract the generated per-architecture tree. A Git source checkout is refused. Build parallelism is not an input. Kernel still uses its tracked scripts/configuration/patches for incremental Kbuild.
-- **Relocation and source identity:** identical archive bytes may move with the workspace without changing identity. Dependency labels inside the workspace are relative; external paths and meaningful compiler/sysroot/flag values remain significant. Both cached outputs and the sole stamp are required; legacy caches without it rebuild once. Ordinary root Runtime builds consult this check before consuming the repository-managed guest tool. Explicit custom guest executables remain supported.
+- **Relocation and source identity:** identical archive bytes may move with the workspace without changing identity. Dependency labels inside the workspace are relative; external paths and meaningful compiler/sysroot/flag values remain significant. Both cached outputs and the sole stamp are required; legacy caches without it rebuild once. `make -C native-deps erofs` performs this check when building or reusing the native tools. Ordinary Runtime builds use the selected host `BUILD_MKFS_EROFS` without invoking the native recipe; ensure that host tool is current before packaging. It does not select the Guest image generator.
 - **Tarball cache:** downloads in `build/tarball/` are verified against the expected digest. EROFS reads a local archive directly, so a changed same-name input cannot hide behind a filename-based cache. An explicitly empty `EROFS_TARBALL_SHA256` supports local source experiments; an unset value retains the production pin. Extraction uses an `.extracted` marker that is discarded on recipe mismatch.
 - **`make clean`:** removes `bin/` and target build output while **retaining** tarball caches and architecture-neutral `build/src/*` source trees. Kernel source trees may contain unexported patch-development work and must not be silently discarded.
 
@@ -203,7 +215,7 @@ Workbench jobs pass the positive integer `KUASAR_BUILD_JOBS` to each recipe. Ker
 
 `deps/build-erofs.sh` extracts erofs-utils into `build/<arch>/src/erofs-utils/`, keeping one tree per architecture because this autotools path does not support out-of-source builds. It runs `autoreconf` and `configure` with compression/FUSE/network features disabled, builds only the `lib`, `mkfs` and `fsck` subdirectories, and writes `bin/<arch>/{mkfs.erofs,fsck.erofs}`.
 
-- The Runtime tool build skips the `mount`/`dump`/`fuse` subdirectories; it also avoids the v1.9.1 mount.erofs pthread-linking issue under `--disable-multithreading`. Standalone bundle validation separately requires a trusted host `dump.erofs` installation (§1.1).
+- The native EROFS tool build skips the `mount`/`dump`/`fuse` subdirectories; it also avoids the v1.9.1 mount.erofs pthread-linking issue under `--disable-multithreading`. Standalone bundle validation separately requires a trusted host `dump.erofs` installation (§1.1).
 - A [maintained source patch](deps/erofs-patches/README.md) explicitly selects Libgcrypt full SHA-256 through `EROFS_USE_LIBGCRYPT_SHA256`. Configure disables OpenSSL and multithreading. Full 32-byte digests, exact 4 KiB chunk deduplication, uncompressed layout and the original v1.9.1 archive pin remain unchanged; no allocator or read-path change is included.
 - The target compiler must statically link `libgcrypt.a`, `libgpg-error.a` and `libuuid.a`. Debian/Ubuntu packages are `libgcrypt20-dev libgpg-error-dev uuid-dev`. Ubuntu 24.04 validation used Libgcrypt `1.10.3-2ubuntu0.2` and Libgpg-error `1.47-3build2.1`; use the actual target distribution's versions, headers and pkg-config metadata. The preflight checks the real target link with private static dependencies and fails with provisioning guidance.
 - RPM devel packages do not necessarily ship static libraries. The openEuler 24.03-LTS-SP4 profile requires the [external runner provider](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/d375effe12531b49f44368d33735c5b7b50b244c/ci/runner/README.md#install) and matching materials described in §1.1. Installing `libgcrypt-devel libgpg-error-devel` alone is insufficient.
