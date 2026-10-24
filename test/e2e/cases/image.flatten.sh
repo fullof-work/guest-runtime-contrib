@@ -169,7 +169,7 @@ ok "static empty-root export, actual pipe, consumer content/metadata and scratch
 
 log "image.flatten: fixed artifact identity on each native architecture"
 capture generator-golden python3 - "$WORK/generator-golden" "$FLATTEN_CTL" <<'PY'
-import hashlib, os, pathlib, shutil, stat, subprocess, sys
+import hashlib, os, pathlib, shutil, stat, subprocess, sys, tarfile
 root = pathlib.Path(sys.argv[1])
 source, scratch = root / "source", root / "scratch"
 source.mkdir(parents=True)
@@ -198,9 +198,14 @@ with artifact.open("wb") as output, subprocess.Popen(command, stdout=subprocess.
         raise SystemExit("fixed generator export failed")
 with artifact.open("rb") as image:
     actual = hashlib.file_digest(image, "sha256").hexdigest()
-# Shared with accelerator's TestGoPlannerCrossArchitectureGolden. The fixed
-# source excludes host architecture, ownership, umask and temporary paths.
-expected = "53497f42d28f1697238d70a3bdd227b740875308831a108cad52bd5009927f16"
+# Shared with accelerator's TestGoPlannerCrossArchitectureGolden. Select the
+# exact carrier golden from its encoding, so released and candidate tarstream
+# libraries both retain a strict cross-architecture byte comparison. The fixed
+# EROFS source excludes host architecture, ownership, umask and temporary paths.
+with tarfile.open(artifact) as stream:
+    presence = stream.getnames()[0] == ".kuasar.presence.v1"
+expected = ("6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca" if presence else
+            "53497f42d28f1697238d70a3bdd227b740875308831a108cad52bd5009927f16")
 if actual != expected:
     raise SystemExit(f"fixed artifact differs on {os.uname().machine}: {actual}; expected {expected}")
 assert not list(scratch.iterdir()), "fixed generator scratch survived"
